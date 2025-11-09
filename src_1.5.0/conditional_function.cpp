@@ -1797,635 +1797,754 @@ void read_cor_file(mat &Cov_, string cor_file, int n)
 
 
 
+/**
+ * ConstructCovRandom - Multi-tissue meta-analysis using fixed and random effects models
+ * 
+ * This function performs meta-analysis across multiple tissues/datasets for all variants
+ * in a region. It computes both fixed effects (assumes homogeneous effects) and random
+ * effects (allows heterogeneity) test statistics.
+ * 
+ * Input data structure:
+ *   z_score_[tissue][gene/region][variant] = tissue-specific z-scores
+ *   beta_[tissue][gene/region][variant]    = tissue-specific effect sizes
+ *   sd_[tissue][gene/region][variant]      = tissue-specific standard errors
+ * 
+ * @param index - which gene/region to analyze (indexes the middle dimension)
+ * @param meta_mode - "fixed" or "random" (determines which results to prioritize)
+ * @param cor_file - optional: pre-computed cross-tissue correlation matrix
+ * @param Han - whether to apply Han & Eskin correction (NOT used in modified Wald test)
+ * @param wald - whether to use Wald test (vs original LRT)
+ * @param z_cutoff - threshold for filtering variants (e.g., |z| > z_cutoff in any tissue)
+ * @param COV - if true, use covariance instead of correlation for cross-tissue structure
+ * 
+ * Returns: p-value of the most significant variant
+ */
 double ConstructCovRandom(vector<vector<vector<double> > > &z_score_, vector<vector<vector<double> > > &beta_,  vector<vector<vector<double> > > &sd_, int index, mat &Res_fixed, mat &Res_random, string meta_mode, string output, vector<vector<string> >  &variant_, map<string, bool> &pos, map<string, bool> &pos1, map <string, vector<double>> &Res, map<string, double > &MAF, vector<double> &VARIANCE, map<int,bool> &data_index, vector<double> &z_score, vector<double> &beta, vector<double> &sd, map<string, string> &ALLELE,string cor_file, bool write_cor, bool Han, bool wald, double z_cutoff, bool COV)
- {
+{
+  // ============================================================================
+  // STEP 1: Organize input data into matrices
+  // ============================================================================
+  // Rows = variants, Columns = tissues
+  mat cov_z_score      = mat(z_score_[0][index].size(), z_score_.size(), fill::zeros);
+  mat cov_beta         = mat(z_score_[0][index].size(), z_score_.size(), fill::zeros);
+  mat cov_z_score_copy = mat(z_score_[0][index].size(), z_score_.size(), fill::zeros);
+  mat cov_sd           = mat(z_score_[0][index].size(), z_score_.size(), fill::zeros);
+  mat cov_sd_copy      = mat(z_score_[0][index].size(), z_score_.size(), fill::zeros);
 
-   mat cov_z_score = mat(z_score_[0][index].size(),z_score_.size(), fill::zeros);
-   mat cov_beta    = mat(z_score_[0][index].size(),z_score_.size(), fill::zeros);
-   mat cov_z_score_copy = mat(z_score_[0][index].size(),z_score_.size(), fill::zeros);
-   mat cov_sd      = mat(z_score_[0][index].size(),z_score_.size(), fill::zeros);
-   mat cov_sd_copy      = mat(z_score_[0][index].size(),z_score_.size(), fill::zeros);
-
-
-   for(int i=0;i<z_score_.size();i++)
-    {  
-      for(int j=0;j<z_score_[i][index].size();j++)
-       {
-         cov_z_score(j,i)=z_score_[i][index][j];
-         cov_beta(j,i)   =beta_[i][index][j];
-         cov_z_score_copy(j,i)=z_score_[i][index][j];
-         cov_sd(j,i)=sd_[i][index][j];
-         cov_sd_copy(j,i)=sd_[i][index][j];
-       }
+  // Extract data for the specified gene/region (indexed by 'index')
+  for(int i = 0; i < z_score_.size(); i++) {  
+    for(int j = 0; j < z_score_[i][index].size(); j++) {
+      cov_z_score(j, i)      = z_score_[i][index][j];
+      cov_beta(j, i)         = beta_[i][index][j];
+      cov_z_score_copy(j, i) = z_score_[i][index][j];
+      cov_sd(j, i)           = sd_[i][index][j];
+      cov_sd_copy(j, i)      = sd_[i][index][j];
     }
+  }
 
-//   cout<<"cov_z_score_copy is: "<<endl;
-//   cout<<cov_z_score_copy<<endl;
-
-
-   vector<int> indice;
-   mat Cov_ =mat(cov_z_score_copy.n_cols,cov_z_score_copy.n_cols, fill::ones);
-   if(cor_file=="")
-    { 
-   for(int i=0;i<cov_z_score.n_rows;i++)
-    {
-        
-      int sym=0;
-      for(int j=0;j<cov_z_score.n_cols;j++)
-       {
-  //       cout<<"Z_score is: "<<cov_z_score(i,j)<<endl;
-  //       Changed by Biao Zeng, 11/08/2020, 11:38 PM.
-//         if(abs(cov_z_score(i,j))>2 || abs(cov_z_score(i,j))<=0.00000001)
-         if(abs(cov_z_score(i,j))>abs(z_cutoff) || abs(cov_z_score(i,j))<=0.00000001)
-          {
-             sym=1;
-          }
-       }
-      if(sym==1)
-       {
-    //     cout<<"Will be removed"<<endl;
-         indice.push_back(i);
-       }
+  // ============================================================================
+  // STEP 2: Filter variants and construct cross-tissue correlation matrix
+  // ============================================================================
+  vector<int> indice;
+  mat Cov_ = mat(cov_z_score_copy.n_cols, cov_z_score_copy.n_cols, fill::ones);
+  
+  if(cor_file == "") {
+    // Filter out variants with extreme or missing z-scores
+    // (These variants would distort the correlation estimation)
+    for(int i = 0; i < cov_z_score.n_rows; i++) {
+      int sym = 0;
+      for(int j = 0; j < cov_z_score.n_cols; j++) {
+        // Remove if: |z| > z_cutoff (too extreme) OR |z| ≈ 0 (missing/invalid)
+        if(abs(cov_z_score(i, j)) > abs(z_cutoff) || abs(cov_z_score(i, j)) <= 0.00000001) {
+          sym = 1;
+        }
+      }
+      if(sym == 1) {
+        indice.push_back(i);
+      }
     }
-//   cout<<"indice"<<endl;
-   uvec Indice = conv_to< uvec >::from(indice);
-   cov_z_score_copy.shed_rows(Indice);
-   cov_sd_copy.shed_rows(Indice);
-//   mat Cov_ =mat(cov_z_score_copy.n_cols,cov_z_score_copy.n_cols, fill::ones);
-   }
-   if(cor_file!="")
-    {
-//      cout<<"Go to extract summary correlation file"<<endl;
-      read_cor_file(Cov_, cor_file, cov_z_score_copy.n_cols);
-//      cout<<"Reading correlation file is done"<<endl;
-    } else
-    {
-//      cout<<"Data used to contruct covariance: "<<endl;
-//      cout<<cov_z_score_copy<<endl;
-//      cout<<"Output data used to construct covariance is done"<<endl;
-//
-//      Changed by Biao Zeng, 10:09 pm, 10/22/2021
-//      Cov_ =cov(cov_z_score_copy);
-        Cov_ =cor(cov_z_score_copy);
-        if(COV)
-         {
-           Cov_ =cov(cov_z_score_copy);
-         }
+    
+    // Remove filtered variants from correlation computation
+    uvec Indice = conv_to<uvec>::from(indice);
+    cov_z_score_copy.shed_rows(Indice);
+    cov_sd_copy.shed_rows(Indice);
+  }
+  
+  // Construct cross-tissue correlation/covariance matrix
+  if(cor_file != "") {
+    // Option A: Read pre-computed correlation matrix from file
+    read_cor_file(Cov_, cor_file, cov_z_score_copy.n_cols);
+  } else {
+    // Option B: Estimate from z-scores across variants
+    // Default: use correlation (standardized)
+    Cov_ = cor(cov_z_score_copy);
+    if(COV) {
+      // Alternative: use covariance (preserves scale differences)
+      Cov_ = cov(cov_z_score_copy);
     }
+  }
 
-   if(write_cor)
-    {
-      string cor_output=output+string("_summary_correlation");
-      fstream  FHOU(cor_output.c_str(),ios::out);
-      for(int i=0;i<Cov_.n_rows;i++)
-       {
-         FHOU<<Cov_(i,0);
-         for(int j=1;j<Cov_.n_cols;j++)
-          {
-            FHOU<<"\t"<<Cov_(i,j);
-          }
-         FHOU<<endl;
-       }
-      FHOU.clear();
-      FHOU.close();
+  // Optionally write correlation matrix to file for inspection/reuse
+  if(write_cor) {
+    string cor_output = output + string("_summary_correlation");
+    fstream FHOU(cor_output.c_str(), ios::out);
+    for(int i = 0; i < Cov_.n_rows; i++) {
+      FHOU << Cov_(i, 0);
+      for(int j = 1; j < Cov_.n_cols; j++) {
+        FHOU << "\t" << Cov_(i, j);
+      }
+      FHOU << endl;
     }
+    FHOU.clear();
+    FHOU.close();
+  }
    
-//   cout<<"Cov_ is: "<<endl;
-//   cout<<Cov_<<endl;
-
-   int I_biao=cov_z_score.n_rows;
-   int peak_index_fixed=-9999;
-   double peak_beta_fixed=-9999;
-   double peak_z_fixed   =0.0;
-   int peak_index_random=-9999;
-   double peak_beta_random=-9999;
-   double peak_z_random   =0.0;
-   mat Output_stat =mat(cov_z_score.n_rows, 3*(cov_z_score.n_cols+1)+1,fill::zeros);
- if(Cov_.n_rows>=3)
-  {
-   for(int i=0;i<cov_z_score.n_rows;i++)
-    {
+  // ============================================================================
+  // STEP 3: Initialize tracking variables and output matrix
+  // ============================================================================
+  int I_biao = cov_z_score.n_rows;
+  
+  // Track the most significant (peak) variant for fixed and random effects
+  int peak_index_fixed = -9999;
+  double peak_beta_fixed = -9999;
+  double peak_z_fixed = 0.0;
+  int peak_index_random = -9999;
+  double peak_beta_random = -9999;
+  double peak_z_random = 0.0;
+  
+  // Output matrix stores results for ALL variants
+  // Columns: [tissue1_beta, tissue1_sd, tissue1_z, tissue2_beta, ..., fixed_beta, fixed_sd, fixed_z, random_z]
+  mat Output_stat = mat(cov_z_score.n_rows, 3*(cov_z_score.n_cols+1)+1, fill::zeros);
+  
+  // ============================================================================
+  // STEP 4: Perform meta-analysis for each variant
+  // ============================================================================
+  if(Cov_.n_rows >= 3) {
+    // Case 1: 3+ tissues - full random effects model possible
+    for(int i = 0; i < cov_z_score.n_rows; i++) {
       mat Cov = Cov_;
       mat Cov1 = Cov_;
-      int peak_index=-9999;
+      int peak_index = -9999;
+      // ------------------------------------------------------------------------
+      // 4a. Store tissue-specific results and construct variant-specific covariance
+      // ------------------------------------------------------------------------
       vector<int> index;
-      map<int,bool> INDEX;
-      for(int X=0;X<Cov.n_rows;X++)
-       {
-         int na_index=0;
-         for(int Y=0;Y<Cov.n_rows;Y++)
-          {
-             if(X==Y)
-              {
-                Cov(X,Y)=cov_sd(i,X)*cov_sd(i,Y);
-                
-              } else
-              {
-                //Changed by Biao Zeng, 11/09/2020, 12:12 AM
-//                Cov(X,Y)=Cov(X,Y)*cov_sd(i,X)*cov_sd(i,Y);
-                 if(Cov(X,Y)>1)
-                  { 
-                    Cov(X,Y)=0.9999*cov_sd(i,X)*cov_sd(i,Y);
-                  } else
-                  {
-                    Cov(X,Y)=Cov(X,Y)*cov_sd(i,X)*cov_sd(i,Y);
-                  }
-              }
-          }
-         if(cov_sd(i,X)<=0.00000001)
-          {
-            na_index=1;
-          }
-         Output_stat(i,3*X+0) = cov_beta(i,X);
-         Output_stat(i,3*X+1) = cov_sd(i,X);
-         if(cov_sd(i,X)==0)
-          {
-            Output_stat(i,3*X+2) = 0;
-          } else
-          {
-            Output_stat(i,3*X+2) = cov_beta(i,X)/cov_sd(i,X);
-          }
-         if(na_index==1)
-          {
-            index.push_back(X);
-            INDEX.insert(pair<int,bool>(X,true));
-          }
-       }
-      double meta_logP;
-      uvec Indice_1 = conv_to< uvec >::from(index); 
-      if(index.size()>0 && Cov.n_rows-index.size()>=3)
-       {
-         Cov.shed_cols(Indice_1); 
-         Cov.shed_rows(Indice_1);     
-         Cov1.shed_cols(Indice_1);
-         Cov1.shed_rows(Indice_1);
-       } else if(Cov.n_rows-index.size()<3 )
-       {
-//         cout<<"Explored variant is: "<<variant_[0][i];
-//         cout<<", Number of tissues available is: "<<Cov.n_rows<<", the tissues to remove is: "<<index.size();
-//         cout<<", and No enough tissue left"<<endl;
-         Output_stat(i,3*Cov.n_rows+0) = 0.0;
-         Output_stat(i,3*Cov.n_rows+1) = 0.0;
-         Output_stat(i,3*Cov.n_rows+2) = 0.0;
-         Output_stat(i,3*(Cov.n_rows+1)+0) = 0.0;
-         vector<double> COL;
-         COL.push_back(-9);
-         COL.push_back(-9);
-         z_score.push_back(0.0);
-         beta.push_back(0.0);
-         sd.push_back(0.0);
-         continue;
-       }
-      vec eigval; //doubleMatrix1D1
-      mat eigvec;  //doubleMatrix2D3
-      eig_sym(eigval, eigvec, Cov) ;
-       bool indicator=false;
-      for(int indx=0;indx<eigval.n_elem;indx++)
-       {
-//         cout<<"Variant "<<i<<", Eigen value for PC"<<indx<<" is: "<<eigval(indx)<<endl;
-         if(eigval(indx)<0)
-          {
-            indicator=true;
-          }
-       }
-      if(indicator)
-       {
-         Output_stat(i,3*Cov.n_rows+0) = 0.0;
-         Output_stat(i,3*Cov.n_rows+1) = 0.0;
-         Output_stat(i,3*Cov.n_rows+2) = 0.0;
-         Output_stat(i,3*(Cov.n_rows+1)+0) = 0.0;
-         vector<double> COL;
-         COL.push_back(-9);
-         COL.push_back(-9);
-         z_score.push_back(0.0);
-         beta.push_back(0.0);
-         sd.push_back(0.0);
-         continue;
-       }
-      mat inv_Cov = inv(Cov);
-      mat Cov_beta= mat(Cov.n_rows,1,fill::zeros);
-      mat Cov_r= mat(Cov.n_rows,1,fill::zeros);
-      for(int J=0,indx=0;J<Cov.n_cols+index.size();)
-       {
-         map<int,bool>::iterator ITE;
-         ITE=INDEX.find(J);
-         if(ITE!=INDEX.end())
-          {
-            J++;
-            continue;
-          }
-         Cov_beta(indx,0) =  cov_beta(i,J);
-         Cov_r(indx,0) =  cov_beta(i,J)/sqrt(VARIANCE[J]);
-         J++;indx++;
-       }
-      mat One =mat(1,Cov_beta.n_rows,fill::ones);
-      mat meta_beta=One*inv_Cov*Cov_beta*1.0/(One*inv_Cov*trans(One));
-      mat meta_r   =One*inv_Cov*Cov_r*1.0/(One*inv_Cov*trans(One));
-      mat Biao=One*inv_Cov*trans(One);
-      double  meta_sd=sqrt(1/Biao(0,0));
-      mat meta_z = meta_beta / meta_sd;
-//      cout<<"Explored variant is: "<<i<<" "<<variant_[0][i]<<" meta_beta is: "<<meta_beta(0,0)<<", meta_sd is: "<<meta_sd<<", and meta_z is: "<<meta_z<<endl;
-      vector<double> COL;
+      map<int, bool> INDEX;
       
-   //   double geno_variance =2*MAF[variant_[0][i]]*(1-MAF[variant_[0][i]]); //Changed by Biao Zeng 10/08/2020, 07:06 am
-      COL.push_back(meta_r(0,0));
-      COL.push_back(meta_z(0,0));
-      Res.insert(pair<string, vector<double>>(variant_[0][i],COL));
-      Output_stat(i,3*Cov_.n_rows+0) = meta_beta(0,0);
-      Output_stat(i,3*Cov_.n_rows+1) = meta_sd;
-      Output_stat(i,3*Cov_.n_rows+2) = meta_z(0,0);
-      z_score.push_back(meta_z(0,0));
-      beta.push_back(meta_beta(0,0));
-      sd.push_back(meta_sd);
-          if(meta_beta(0,0)<=0)
-            {
-               meta_logP = log10(2.0*normcdf(meta_z(0,0)));
-            } else
-            {
-              meta_logP = log10(2.0*(1-normcdf(meta_z(0,0))));
+      for(int X = 0; X < Cov.n_rows; X++) {
+        int na_index = 0;
+        
+        // Convert correlation to covariance using tissue-specific SEs
+        for(int Y = 0; Y < Cov.n_rows; Y++) {
+          if(X == Y) {
+            // Diagonal: variance = SE²
+            Cov(X, Y) = cov_sd(i, X) * cov_sd(i, Y);
+          } else {
+            // Off-diagonal: covariance = correlation × SE_X × SE_Y
+            // Cap correlation at 0.9999 to avoid numerical issues
+            if(Cov(X, Y) > 1) {
+              Cov(X, Y) = 0.9999 * cov_sd(i, X) * cov_sd(i, Y);
+            } else {
+              Cov(X, Y) = Cov(X, Y) * cov_sd(i, X) * cov_sd(i, Y);
             }
-     if(meta_z(0,0)*meta_z(0,0)>peak_z_fixed*peak_z_fixed && pos[variant_[0][i]]) 
-      {
-        peak_index_fixed=i;
-        peak_beta_fixed= meta_beta(0,0);
-        peak_z_fixed   = meta_z(0,0);
+          }
+        }
+        
+        // Check for missing data (SE ≈ 0)
+        if(cov_sd(i, X) <= 0.00000001) {
+          na_index = 1;
+        }
+        
+        // Store tissue-specific results for this variant
+        Output_stat(i, 3*X+0) = cov_beta(i, X);         // Beta
+        Output_stat(i, 3*X+1) = cov_sd(i, X);           // SE
+        if(cov_sd(i, X) == 0) {
+          Output_stat(i, 3*X+2) = 0;                    // Z-score (undefined if SE=0)
+        } else {
+          Output_stat(i, 3*X+2) = cov_beta(i, X) / cov_sd(i, X);  // Z-score
+        }
+        
+        // Mark tissues with missing data for removal
+        if(na_index == 1) {
+          index.push_back(X);
+          INDEX.insert(pair<int, bool>(X, true));
+        }
       }
-      int I_biao=Cov_beta.n_rows;
-      cx_mat  square_root_invCov=sqrtmat(inv_Cov);
-      mat Cov_beta_adjust=real(square_root_invCov)*Cov_beta;
-      mat Cov_beta_adjust_sqr= trans(Cov_beta_adjust) * Cov_beta_adjust;
+      
+      // ------------------------------------------------------------------------
+      // 4b. Handle missing tissues
+      // ------------------------------------------------------------------------
+      double meta_logP;
+      uvec Indice_1 = conv_to<uvec>::from(index);
+      
+      if(index.size() > 0 && Cov.n_rows - index.size() >= 3) {
+        // Remove tissues with missing data but keep enough for random effects
+        Cov.shed_cols(Indice_1);
+        Cov.shed_rows(Indice_1);
+        Cov1.shed_cols(Indice_1);
+        Cov1.shed_rows(Indice_1);
+      } else if(Cov.n_rows - index.size() < 3) {
+        // Not enough tissues remain - skip meta-analysis
+        Output_stat(i, 3*Cov.n_rows+0) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+1) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+2) = 0.0;
+        Output_stat(i, 3*(Cov.n_rows+1)+0) = 0.0;
+        vector<double> COL;
+        COL.push_back(-9);
+        COL.push_back(-9);
+        z_score.push_back(0.0);
+        beta.push_back(0.0);
+        sd.push_back(0.0);
+        continue;
+      }
+      
+      // ------------------------------------------------------------------------
+      // 4c. Check covariance matrix validity
+      // ------------------------------------------------------------------------
+      vec eigval;  // Eigenvalues of covariance matrix
+      mat eigvec;  // Eigenvectors
+      eig_sym(eigval, eigvec, Cov);
+      
+      bool indicator = false;
+      for(int indx = 0; indx < eigval.n_elem; indx++) {
+        if(eigval(indx) < 0) {
+          indicator = true;  // Negative eigenvalue = not positive definite
+        }
+      }
+      
+      if(indicator) {
+        // Covariance matrix is not positive definite - skip this variant
+        Output_stat(i, 3*Cov.n_rows+0) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+1) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+2) = 0.0;
+        Output_stat(i, 3*(Cov.n_rows+1)+0) = 0.0;
+        vector<double> COL;
+        COL.push_back(-9);
+        COL.push_back(-9);
+        z_score.push_back(0.0);
+        beta.push_back(0.0);
+        sd.push_back(0.0);
+        continue;
+      }
+      
+      // ------------------------------------------------------------------------
+      // 4d. Fixed Effects Meta-Analysis
+      // ------------------------------------------------------------------------
+      // Inverse variance weighted meta-analysis assuming homogeneous effects
+      // β_fixed = (1' Σ^(-1) β) / (1' Σ^(-1) 1)
+      // SE_fixed = sqrt(1 / (1' Σ^(-1) 1))
+      
+      mat inv_Cov = inv(Cov);
+      mat Cov_beta = mat(Cov.n_rows, 1, fill::zeros);
+      mat Cov_r = mat(Cov.n_rows, 1, fill::zeros);
+      
+      // Extract betas for tissues with valid data
+      for(int J = 0, indx = 0; J < Cov.n_cols + index.size();) {
+        map<int, bool>::iterator ITE;
+        ITE = INDEX.find(J);
+        if(ITE != INDEX.end()) {
+          J++;
+          continue;
+        }
+        Cov_beta(indx, 0) = cov_beta(i, J);
+        Cov_r(indx, 0) = cov_beta(i, J) / sqrt(VARIANCE[J]);
+        J++;
+        indx++;
+      }
+      
+      // Compute fixed effects estimate
+      mat One = mat(1, Cov_beta.n_rows, fill::ones);
+      mat meta_beta = One * inv_Cov * Cov_beta * 1.0 / (One * inv_Cov * trans(One));
+      mat meta_r = One * inv_Cov * Cov_r * 1.0 / (One * inv_Cov * trans(One));
+      mat Biao = One * inv_Cov * trans(One);
+      double meta_sd = sqrt(1 / Biao(0, 0));
+      mat meta_z = meta_beta / meta_sd;
+      
+      // Store fixed effects results
+      vector<double> COL;
+      COL.push_back(meta_r(0, 0));
+      COL.push_back(meta_z(0, 0));
+      Res.insert(pair<string, vector<double>>(variant_[0][i], COL));
+      Output_stat(i, 3*Cov_.n_rows+0) = meta_beta(0, 0);  // Fixed effects beta
+      Output_stat(i, 3*Cov_.n_rows+1) = meta_sd;          // Fixed effects SE
+      Output_stat(i, 3*Cov_.n_rows+2) = meta_z(0, 0);     // Fixed effects z-score
+      z_score.push_back(meta_z(0, 0));
+      beta.push_back(meta_beta(0, 0));
+      sd.push_back(meta_sd);
+      
+      // Compute two-sided p-value for logging
+      if(meta_beta(0, 0) <= 0) {
+        meta_logP = log10(2.0 * normcdf(meta_z(0, 0)));
+      } else {
+        meta_logP = log10(2.0 * (1 - normcdf(meta_z(0, 0))));
+      }
+      
+      // Track peak (most significant) variant for fixed effects
+      if(meta_z(0, 0) * meta_z(0, 0) > peak_z_fixed * peak_z_fixed && pos[variant_[0][i]]) {
+        peak_index_fixed = i;
+        peak_beta_fixed = meta_beta(0, 0);
+        peak_z_fixed = meta_z(0, 0);
+      }
+      
+      // ------------------------------------------------------------------------
+      // 4e. Random Effects Meta-Analysis - Setup for MLE
+      // ------------------------------------------------------------------------
+      // Original implementation: Likelihood ratio test for H0: β=0 AND σ²_β=0
+      // Modified implementation: Wald test for H0: β=0 (allowing σ²_β > 0)
+      //
+      // The original code uses maximum likelihood to estimate σ²_β (heterogeneity)
+      // by optimizing over a restricted eigenspace. We use this MLE to construct
+      // a Wald test that only tests β=0.
+      
+      int I_biao = Cov_beta.n_rows;
+      cx_mat square_root_invCov = sqrtmat(inv_Cov);
+      mat Cov_beta_adjust = real(square_root_invCov) * Cov_beta;
+      mat Cov_beta_adjust_sqr = trans(Cov_beta_adjust) * Cov_beta_adjust;
       mat doubleMatrix1D1 = eigval;
       int I = I_biao;
-      mat doubleMatrix2D4 = mat(I,I,fill::eye);
-      mat doubleMatrix2D5 = mat(I,I,fill::ones)/I;
-      doubleMatrix2D4    = doubleMatrix2D4 - doubleMatrix2D5;
-      mat doubleMatrix2D6 = mat(I,I,fill::eye);
-      doubleMatrix2D6 = doubleMatrix2D6 + Cov;
-      mat  doubleMatrix2D7 = doubleMatrix2D4 * trans(doubleMatrix2D6) * trans(doubleMatrix2D4);
+      
+      // Transform to restricted eigenspace for MLE of σ²_β
+      // This removes the dimension corresponding to the mean (intercept)
+      mat doubleMatrix2D4 = mat(I, I, fill::eye);
+      mat doubleMatrix2D5 = mat(I, I, fill::ones) / I;
+      doubleMatrix2D4 = doubleMatrix2D4 - doubleMatrix2D5;  // Centering matrix
+      
+      mat doubleMatrix2D6 = mat(I, I, fill::eye);
+      doubleMatrix2D6 = doubleMatrix2D6 + Cov;  // I + ρ (correlation structure)
+      mat doubleMatrix2D7 = doubleMatrix2D4 * trans(doubleMatrix2D6) * trans(doubleMatrix2D4);
+      
+      // Eigendecomposition of centered heterogeneity structure
       vec eigval2;
       mat eigvec2;
-      eig_sym( eigval2, eigvec2, doubleMatrix2D7);
-      vec eigval2_1 = eigval2-1;
+      eig_sym(eigval2, eigvec2, doubleMatrix2D7);
+      vec eigval2_1 = eigval2 - 1;
       mat eigvec2_1 = eigvec2;
+      
+      // Remove first eigenvector (corresponds to mean)
       vector<int> test_index;
       test_index.push_back(0);
-      uvec Indices = conv_to< uvec >::from(test_index);
+      uvec Indices = conv_to<uvec>::from(test_index);
       eigvec2_1.shed_cols(Indices);
       mat doubleMatrix2D8 = eigvec2_1;
-      int Test=I-1;
-      mat doubleMatrix1D2 = mat(I-1,1,fill::zeros);
-      for(int X=1;X<I;X++)
-       {
-         doubleMatrix1D2(X-1,0)=eigval2_1(X);
-       }
-      mat doubleMatrix1D3 = mat(I,1,fill::zeros);
-      mat  doubleMatrix1D4 = trans(doubleMatrix2D8) * Cov_beta;
-      mat  doubleMatrix1D5 = doubleMatrix1D4 % doubleMatrix1D4;
+      
+      int Test = I - 1;
+      mat doubleMatrix1D2 = mat(I-1, 1, fill::zeros);
+      for(int X = 1; X < I; X++) {
+        doubleMatrix1D2(X-1, 0) = eigval2_1(X);
+      }
+      
+      // Project betas onto restricted eigenspace
+      mat doubleMatrix1D3 = mat(I, 1, fill::zeros);
+      mat doubleMatrix1D4 = trans(doubleMatrix2D8) * Cov_beta;
+      mat doubleMatrix1D5 = doubleMatrix1D4 % doubleMatrix1D4;  // Squared projections
       mat doubleMatrix1D6 = doubleMatrix1D1;
       mat doubleMatrix1D7 = doubleMatrix1D2;
-      double start=0.0;
+      
+      // ------------------------------------------------------------------------
+      // 4f. Maximum likelihood estimation of σ²_β
+      // ------------------------------------------------------------------------
+      double start = 0.0;
       double end = 10000;
       vector<double> DoubleMatrix1D5;
       vector<double> DoubleMatrix1D6;
       vector<double> DoubleMatrix1D7;
-      for(int j=0;j<doubleMatrix1D5.n_rows;j++)
-       {
-         DoubleMatrix1D5.push_back(doubleMatrix1D5(j,0));
-       }
-      for(int j=0;j<doubleMatrix1D6.n_rows;j++)
-       {
-         DoubleMatrix1D6.push_back(doubleMatrix1D6(j,0));
-       }
-      for(int j=0;j<doubleMatrix1D7.n_rows;j++)
-       {
-         DoubleMatrix1D7.push_back(doubleMatrix1D7(j,0));
-       }
-      double result1=-9999.0;
-      double result2=-9999.0;
-      brent_method(DoubleMatrix1D6, DoubleMatrix1D5, DoubleMatrix1D7,start, end, result1, result2);
-      double d2 =-result2;
-      double d4 = Cov_beta_adjust_sqr(0,0);
-      double d3 = -0.5 * (I * log(6.2831853071795862) + sum(log(eigval)) + d4);
-      double d5 = -2.0 * (d3 - d2);
-      double statisticRandomEffects2_ = d5;
-      //Changed ny Biao Zeng, 10/28/2020, 2:35 pm
-//      if(statisticRandomEffects2_<0) 
-       if(statisticRandomEffects2_<0.01)
-       {
-         statisticRandomEffects2_=0;
-       }
-
-      cout<<"statisticRandomEffects2_ for "<<variant_[0][i]<<"  is: "<<statisticRandomEffects2_<<endl;
-
-      double pvalueRandomEffects2Asymptotic_ = 0.5 * gsl_cdf_chisq_Q (statisticRandomEffects2_, 1.0) + 0.5 * gsl_cdf_chisq_Q (statisticRandomEffects2_, 2.0);
-      if(pvalueRandomEffects2Asymptotic_ >=0.000001)
-       {
-         pos1[variant_[0][i]]=false;
-       }
-
-   
-      //Changed by Biao Zeng, 10/28/2020, 4:01 pm
+      for(int j = 0; j < doubleMatrix1D5.n_rows; j++) {
+        DoubleMatrix1D5.push_back(doubleMatrix1D5(j, 0));
+      }
+      for(int j = 0; j < doubleMatrix1D6.n_rows; j++) {
+        DoubleMatrix1D6.push_back(doubleMatrix1D6(j, 0));
+      }
+      for(int j = 0; j < doubleMatrix1D7.n_rows; j++) {
+        DoubleMatrix1D7.push_back(doubleMatrix1D7(j, 0));
+      }
+      
+      // Optimize likelihood to find MLE of σ²_β
+      double result1 = -9999.0;  // Will hold MLE of σ²_β
+      double result2 = -9999.0;  // Will hold max log-likelihood
+      brent_method(DoubleMatrix1D6, DoubleMatrix1D5, DoubleMatrix1D7, start, end, result1, result2);
+      
+      // Likelihood ratio test statistic (original implementation)
+      double d2 = -result2;  // Neg log-likelihood under alternative (σ²_β = MLE)
+      double d4 = Cov_beta_adjust_sqr(0, 0);
+      double d3 = -0.5 * (I * log(6.2831853071795862) + sum(log(eigval)) + d4);  // Under null
+      double d5 = -2.0 * (d3 - d2);  // LRT statistic
+      
+      // ========================================================================
+      // DAK/Claude MODIFIED: Wald test for H0: β=0 under random effects model
+      // ========================================================================
+      // ORIGINAL: LRT for H0: β=0 AND σ²_β=0
+      // MODIFIED: Wald test for H0: β=0 only (allowing σ²_β > 0)
       //
-      if(statisticRandomEffects2_<=0)
-       { 
-         statisticRandomEffects2_= meta_z(0,0) * meta_z(0,0);
-       } else if(Han)
-       {
-         cout<<"Apply Han method to correct"<<endl;
-         double p_Han_adjust=Han_adjust( Cov1.n_cols, Cov1,  sqrt(statisticRandomEffects2_));
-         cout<<"adjust p value is: "<<p_Han_adjust<<endl;
-         double statisticRandomEffects2_2= abs(gsl_cdf_ugaussian_Pinv (p_Han_adjust/2));
-         if(statisticRandomEffects2_2!=datum::inf)
-          {
-            statisticRandomEffects2_=statisticRandomEffects2_2*statisticRandomEffects2_2;
-          }                     
-       }
-
-      Output_stat(i,3*(Cov_.n_rows+1)+0) = sqrt(statisticRandomEffects2_);
-      if(statisticRandomEffects2_*statisticRandomEffects2_>peak_z_random*peak_z_random  && pos[variant_[0][i]])
-      {
-        peak_index_random=i;
-        peak_z_random   = statisticRandomEffects2_;
+      // Strategy:
+      // 1. Use MLE of σ²_β from likelihood optimization above (stored in result1)
+      // 2. Construct random effects covariance: Σ_RE = Σ + σ²_β * I
+      // 3. Compute random effects estimate β_RE and its SE
+      // 4. Test H0: β=0 using Wald statistic Z² = (β_RE/SE_RE)² ~ χ²(1)
+      
+      // Estimate heterogeneity variance σ²_β
+      double sigma2_beta_hat = 0.0;
+      if(d5 > 0) {
+        // LRT indicates heterogeneity - use MLE
+        sigma2_beta_hat = result1;
       }
-   }
-  if(peak_index_random<0)
-   {
-     return -1;
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_random(j,0)=peak_index_random;
-     Res_random(j,1)=cov_beta(peak_index_random,j);
-     Res_random(j,2)=peak_z_random;     
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_fixed(j,0)=peak_index_fixed;
-     Res_fixed(j,1)=peak_beta_fixed;
-     Res_fixed(j,2)=peak_z_fixed;
-   }
- fstream  FHOU(output.c_str(),ios::out);
-   if(!FHOU)
-    {
-      cout<<"Error for input or output"<<endl;
+      // If d5 ≤ 0, no evidence of heterogeneity, use σ²_β = 0 (equivalent to fixed effects)
+      
+      // Construct random effects covariance: Σ_RE = Σ + σ²_β * I
+      mat Cov_RE = Cov + sigma2_beta_hat * mat(I, I, fill::eye);
+      mat inv_Cov_RE = inv(Cov_RE);
+      mat One_RE = mat(1, Cov_beta.n_rows, fill::ones);
+      
+      // Random effects estimate: β_RE = (1' Σ_RE^(-1) β) / (1' Σ_RE^(-1) 1)
+      mat beta_RE = One_RE * inv_Cov_RE * Cov_beta / (One_RE * inv_Cov_RE * trans(One_RE));
+      
+      // Standard error: SE_RE = sqrt(1 / (1' Σ_RE^(-1) 1))
+      // Note: SE_RE ≥ SE_fixed when σ²_β > 0 (accounts for heterogeneity)
+      mat se_RE_sq = 1.0 / (One_RE * inv_Cov_RE * trans(One_RE));
+      double se_RE = sqrt(se_RE_sq(0, 0));
+      
+      // Wald test statistic: Z² = (β_RE / SE_RE)² ~ χ²(1) under H0: β=0
+      double z = beta_RE(0, 0) / se_RE;
+      double statisticRandomEffects2_ = z * z; 
+      
+      // Safety check for numerical issues
+      if(statisticRandomEffects2_ < 0.01) {
+        statisticRandomEffects2_ = 0;
+      }
+
+      cout << "statisticRandomEffects2_ for " << variant_[0][i] 
+           << "  is: " << statisticRandomEffects2_ 
+           << " (Wald test for beta=0, sigma2_beta_hat=" << sigma2_beta_hat << ")" << endl;
+
+      // Compute p-value using χ²(1) distribution
+      // NOTE: NOT the 0.5*χ²(1) + 0.5*χ²(2) mixture used in original LRT
+      double pvalueRandomEffects2Asymptotic_ = gsl_cdf_chisq_Q(statisticRandomEffects2_, 1.0);
+      if(pvalueRandomEffects2Asymptotic_ >= 0.000001) {
+        pos1[variant_[0][i]] = false;
+      }
+
+      // ========================================================================
+      // Fallback handling (no Han correction for Wald test)
+      // ========================================================================
+      // Han & Eskin correction was designed for the LRT's mixture distribution
+      // Wald test already accounts for correlation via full Σ_RE matrix
+      //
+      if(statisticRandomEffects2_ <= 0) { 
+        // Safety fallback: use fixed effects if Wald test fails (shouldn't happen)
+        cout << "WARNING: Wald test statistic <=0, falling back to fixed effects" << endl;
+        statisticRandomEffects2_ = meta_z(0, 0) * meta_z(0, 0);
+      }
+
+      // Store the signed z-score (preserves direction of effect)
+      // This is consistent with tissue-specific and fixed effects z-scores
+      Output_stat(i, 3*(Cov_.n_rows+1)+0) = z;
+      
+      // Track peak (most significant) variant for random effects
+      if(statisticRandomEffects2_ * statisticRandomEffects2_ > peak_z_random * peak_z_random && pos[variant_[0][i]]) {
+        peak_index_random = i;
+        peak_z_random = statisticRandomEffects2_;
+      }
+    }  // End of loop over all variants (3+ tissues case)
+    
+    // ========================================================================
+    // STEP 5: Save peak variant results and write output file
+    // ========================================================================
+    if(peak_index_random < 0) {
+      return -1;  // No valid peak found
+    }
+    
+    // Store peak variant results for random effects
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_random(j, 0) = peak_index_random;
+      Res_random(j, 1) = cov_beta(peak_index_random, j);
+      Res_random(j, 2) = peak_z_random;
+    }
+    
+    // Store peak variant results for fixed effects
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_fixed(j, 0) = peak_index_fixed;
+      Res_fixed(j, 1) = peak_beta_fixed;
+      Res_fixed(j, 2) = peak_z_fixed;
+    }
+    
+    // Write results for all variants to file
+    fstream FHOU(output.c_str(), ios::out);
+    if(!FHOU) {
+      cout << "Error for input or output" << endl;
       return (1);
     }
-   FHOU<<"Variant"<<"\t"<<"Allele";
-   for(int j=0,indx=0;j<data_index.size();)
-    {
-      if(!data_index[j])
-       {
-         j++;
-         continue;
-         
-       }
-      
-      FHOU<<"\t"<<"beta_tissue_"<<j<<"\t"<<"sd_tissue_"<<j<<"\t"<<"z_tissue_"<<j;
+    
+    // Write header
+    FHOU << "Variant" << "\t" << "Allele";
+    for(int j = 0, indx = 0; j < data_index.size();) {
+      if(!data_index[j]) {
+        j++;
+        continue;
+      }
+      FHOU << "\t" << "beta_tissue_" << j << "\t" << "sd_tissue_" << j << "\t" << "z_tissue_" << j;
       j++;
       indx++;
     }
-   FHOU<<"\t"<<"fixed_beta"<<"\t"<<"fixed_sd"<<"\t"<<"fixed_z";
-   FHOU<<"\t"<<"Random_Z"<<endl;
-   for(int j1=0;j1<Output_stat.n_rows;j1++)
-    {
-      if(!pos[variant_[0][j1]])
-       {
-         continue;
-       }
+    FHOU << "\t" << "fixed_beta" << "\t" << "fixed_sd" << "\t" << "fixed_z";
+    FHOU << "\t" << "Random_Z" << endl;
+    
+    // Write data for all variants
+    for(int j1 = 0; j1 < Output_stat.n_rows; j1++) {
+      if(!pos[variant_[0][j1]]) {
+        continue;  // Skip filtered variants
+      }
       string test = variant_[0][j1];
-      FHOU<<test<<"\t"<<ALLELE[test];
-      for(int j2=0;j2<Output_stat.n_cols;j2++)
-       {
-         FHOU<<"\t"<<Output_stat(j1,j2); 
-       }
-      FHOU<<endl;
-    }
-   FHOU.clear();
-   FHOU.close();
-  } else if(Cov_.n_rows==2)
-  {
-//    cout<<"There are only 2 data set available for analysis"<<endl;
-    for(int i=0;i<cov_z_score.n_rows;i++)
-    {
-      mat Cov = Cov_;
-      int peak_index=-9999;
-      vector<int> index;
-      map<int,bool> INDEX;
-      for(int X=0;X<Cov.n_rows;X++)
-       {
-         int na_index=0;
-         for(int Y=0;Y<Cov.n_rows;Y++)
-          {
-             if(X==Y)
-              {
-                Cov(X,Y)=cov_sd(i,X)*cov_sd(i,Y);
-
-              } else
-              {
-                Cov(X,Y)=Cov(X,Y)*cov_sd(i,X)*cov_sd(i,Y);
-              }
-          }
-         if(cov_sd(i,X)<=0.00000001)
-          {
-            na_index=1;
-          }
-         Output_stat(i,3*X+0) = cov_beta(i,X);
-         Output_stat(i,3*X+1) = cov_sd(i,X);
-         if(cov_sd(i,X)==0)
-          {
-            Output_stat(i,3*X+2) = 0;
-          } else
-          {
-            Output_stat(i,3*X+2) = cov_beta(i,X)/cov_sd(i,X);
-          }
-         if(na_index==1)
-          {
-            index.push_back(X);
-            INDEX.insert(pair<int,bool>(X,true));
-          }
-       }
-      double meta_logP;
-      uvec Indice_1 = conv_to< uvec >::from(index);
-      if(index.size()>0 && Cov.n_rows-index.size()>=2)
-       {
-         Cov.shed_cols(Indice_1);
-         Cov.shed_rows(Indice_1);
-       } else if(Cov.n_rows-index.size()<2 )
-       {
-        Output_stat(i,3*Cov.n_rows+0) = 0.0;
-         Output_stat(i,3*Cov.n_rows+1) = 0.0;
-         Output_stat(i,3*Cov.n_rows+2) = 0.0;
-         Output_stat(i,3*(Cov.n_rows+1)+0) = 0.0;
-         vector<double> COL;
-         COL.push_back(-9);
-         COL.push_back(-9);
-         z_score.push_back(0.0);
-         beta.push_back(0.0);
-         sd.push_back(0.0);
-         continue;
-       }
-      vec eigval; //doubleMatrix1D1
-      mat eigvec;  //doubleMatrix2D3
-      eig_sym(eigval, eigvec, Cov) ;
-       bool indicator=false;
-      for(int indx=0;indx<eigval.n_elem;indx++)
-       {
-         if(eigval(indx)<0)
-          {
-            indicator=true;
-          }
-       }
-      if(indicator)
-       {
-         Output_stat(i,3*Cov.n_rows+0) = 0.0;
-         Output_stat(i,3*Cov.n_rows+1) = 0.0;
-         Output_stat(i,3*Cov.n_rows+2) = 0.0;
-         Output_stat(i,3*(Cov.n_rows+1)+0) = 0.0;
-         vector<double> COL;
-         COL.push_back(-9);
-         COL.push_back(-9);
-         z_score.push_back(0.0);
-         beta.push_back(0.0);
-         sd.push_back(0.0);
-         continue;
-       }
-      mat inv_Cov = inv(Cov);
-      mat Cov_beta= mat(Cov.n_rows,1,fill::zeros);
-      mat Cov_r= mat(Cov.n_rows,1,fill::zeros);
-      for(int J=0,indx=0;J<Cov.n_cols+index.size();)
-       {
-         map<int,bool>::iterator ITE;
-         ITE=INDEX.find(J);
-         if(ITE!=INDEX.end())
-          {
-            J++;
-            continue;
-          }
-         Cov_beta(indx,0) =  cov_beta(i,J);
-         Cov_r(indx,0) =  cov_beta(i,J)/sqrt(VARIANCE[J]);
-         J++;indx++;
-       }
-      mat One =mat(1,Cov_beta.n_rows,fill::ones);
-      mat meta_beta=One*inv_Cov*Cov_beta*1.0/(One*inv_Cov*trans(One));
-      mat meta_r   =One*inv_Cov*Cov_r*1.0/(One*inv_Cov*trans(One));
-      mat Biao=One*inv_Cov*trans(One);
-      double  meta_sd=sqrt(1/Biao(0,0));
-      mat meta_z = meta_beta / meta_sd;
-      vector<double> COL;
-      
-   //   double geno_variance =2*MAF[variant_[0][i]]*(1-MAF[variant_[0][i]]); // Changed by Biao Zeng, 10/08/2020, 07:07 am
-      COL.push_back(meta_r(0,0));
-      COL.push_back(meta_z(0,0));
-      Res.insert(pair<string, vector<double>>(variant_[0][i],COL));
-      Output_stat(i,3*Cov_.n_rows+0) = meta_beta(0,0);
-      Output_stat(i,3*Cov_.n_rows+1) = meta_sd;
-      Output_stat(i,3*Cov_.n_rows+2) = meta_z(0,0);
-      z_score.push_back(meta_z(0,0));
-      beta.push_back(meta_beta(0,0));
-sd.push_back(meta_sd);
-          if(meta_beta(0,0)<=0)
-            {
-               meta_logP = log10(2.0*normcdf(meta_z(0,0)));
-            } else
-            {
-              meta_logP = log10(2.0*(1-normcdf(meta_z(0,0))));
-            }
-     if(meta_z(0,0)*meta_z(0,0)>peak_z_fixed*peak_z_fixed && pos[variant_[0][i]])
-      {
-        peak_index_fixed=i;
-        peak_beta_fixed= meta_beta(0,0);
-        peak_z_fixed   = meta_z(0,0);
-        peak_index_random=i;
-        peak_beta_random= meta_beta(0,0);
-        peak_z_random   = meta_z(0,0);
+      FHOU << test << "\t" << ALLELE[test];
+      for(int j2 = 0; j2 < Output_stat.n_cols; j2++) {
+        FHOU << "\t" << Output_stat(j1, j2);
       }
-  
-      double pvalueRandomEffects2Asymptotic_ = 2.0*(1-normcdf(meta_z(0,0)));
-      if(pvalueRandomEffects2Asymptotic_ >=0.000001)
-       {
-         pos1[variant_[0][i]]=false;
-       }
+      FHOU << endl;
+    }
+    FHOU.clear();
+    FHOU.close();
+    
+  } else if(Cov_.n_rows == 2) {
+    // ========================================================================
+    // Case 2: Only 2 tissues - simplified meta-analysis
+    // ========================================================================
+    // With only 2 tissues, random effects model is not well-powered
+    // Use fixed effects approach
+    
+    for(int i = 0; i < cov_z_score.n_rows; i++) {
+      mat Cov = Cov_;
+      int peak_index = -9999;
+      vector<int> index;
+      map<int, bool> INDEX;
+      
+      // Store tissue-specific results and construct covariance
+      for(int X = 0; X < Cov.n_rows; X++) {
+        int na_index = 0;
+        
+        // Convert correlation to covariance
+        for(int Y = 0; Y < Cov.n_rows; Y++) {
+          if(X == Y) {
+            Cov(X, Y) = cov_sd(i, X) * cov_sd(i, Y);
+          } else {
+            Cov(X, Y) = Cov(X, Y) * cov_sd(i, X) * cov_sd(i, Y);
+          }
+        }
+        
+        // Check for missing data
+        if(cov_sd(i, X) <= 0.00000001) {
+          na_index = 1;
+        }
+        
+        // Store tissue-specific results
+        Output_stat(i, 3*X+0) = cov_beta(i, X);
+        Output_stat(i, 3*X+1) = cov_sd(i, X);
+        if(cov_sd(i, X) == 0) {
+          Output_stat(i, 3*X+2) = 0;
+        } else {
+          Output_stat(i, 3*X+2) = cov_beta(i, X) / cov_sd(i, X);
+        }
+        
+        // Mark tissues with missing data
+        if(na_index == 1) {
+          index.push_back(X);
+          INDEX.insert(pair<int, bool>(X, true));
+        }
+      }
+      
+      double meta_logP;
+      uvec Indice_1 = conv_to<uvec>::from(index);
+      
+      if(index.size() > 0 && Cov.n_rows - index.size() >= 2) {
+        // Remove tissues with missing data
+        Cov.shed_cols(Indice_1);
+        Cov.shed_rows(Indice_1);
+      } else if(Cov.n_rows - index.size() < 2) {
+        // Not enough tissues remain - skip this variant
+        Output_stat(i, 3*Cov.n_rows+0) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+1) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+2) = 0.0;
+        Output_stat(i, 3*(Cov.n_rows+1)+0) = 0.0;
+        vector<double> COL;
+        COL.push_back(-9);
+        COL.push_back(-9);
+        z_score.push_back(0.0);
+        beta.push_back(0.0);
+        sd.push_back(0.0);
+        continue;
+      }
+      
+      // Check covariance matrix validity
+      vec eigval;
+      mat eigvec;
+      eig_sym(eigval, eigvec, Cov);
+      bool indicator = false;
+      for(int indx = 0; indx < eigval.n_elem; indx++) {
+        if(eigval(indx) < 0) {
+          indicator = true;
+        }
+      }
+      
+      if(indicator) {
+        // Matrix is not positive definite - skip this variant
+        Output_stat(i, 3*Cov.n_rows+0) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+1) = 0.0;
+        Output_stat(i, 3*Cov.n_rows+2) = 0.0;
+        Output_stat(i, 3*(Cov.n_rows+1)+0) = 0.0;
+        vector<double> COL;
+        COL.push_back(-9);
+        COL.push_back(-9);
+        z_score.push_back(0.0);
+        beta.push_back(0.0);
+        sd.push_back(0.0);
+        continue;
+      }
+      
+      // Fixed effects meta-analysis (used for both fixed and random since only 2 tissues)
+      mat inv_Cov = inv(Cov);
+      mat Cov_beta = mat(Cov.n_rows, 1, fill::zeros);
+      mat Cov_r = mat(Cov.n_rows, 1, fill::zeros);
+      
+      // Extract betas for valid tissues
+      for(int J = 0, indx = 0; J < Cov.n_cols + index.size();) {
+        map<int, bool>::iterator ITE;
+        ITE = INDEX.find(J);
+        if(ITE != INDEX.end()) {
+          J++;
+          continue;
+        }
+        Cov_beta(indx, 0) = cov_beta(i, J);
+        Cov_r(indx, 0) = cov_beta(i, J) / sqrt(VARIANCE[J]);
+        J++;
+        indx++;
+      }
+      
+      // Compute fixed effects estimate
+      mat One = mat(1, Cov_beta.n_rows, fill::ones);
+      mat meta_beta = One * inv_Cov * Cov_beta * 1.0 / (One * inv_Cov * trans(One));
+      mat meta_r = One * inv_Cov * Cov_r * 1.0 / (One * inv_Cov * trans(One));
+      mat Biao = One * inv_Cov * trans(One);
+      double meta_sd = sqrt(1 / Biao(0, 0));
+      mat meta_z = meta_beta / meta_sd;
+      
+      vector<double> COL;
+      COL.push_back(meta_r(0, 0));
+      COL.push_back(meta_z(0, 0));
+      Res.insert(pair<string, vector<double>>(variant_[0][i], COL));
+      
+      // Store results (same for fixed and random with only 2 tissues)
+      Output_stat(i, 3*Cov_.n_rows+0) = meta_beta(0, 0);
+      Output_stat(i, 3*Cov_.n_rows+1) = meta_sd;
+      Output_stat(i, 3*Cov_.n_rows+2) = meta_z(0, 0);
+      z_score.push_back(meta_z(0, 0));
+      beta.push_back(meta_beta(0, 0));
+      sd.push_back(meta_sd);
+      
+      // Compute p-value
+      if(meta_beta(0, 0) <= 0) {
+        meta_logP = log10(2.0 * normcdf(meta_z(0, 0)));
+      } else {
+        meta_logP = log10(2.0 * (1 - normcdf(meta_z(0, 0))));
+      }
+      
+      // Track peak variant (same for fixed and random with 2 tissues)
+      if(meta_z(0, 0) * meta_z(0, 0) > peak_z_fixed * peak_z_fixed && pos[variant_[0][i]]) {
+        peak_index_fixed = i;
+        peak_beta_fixed = meta_beta(0, 0);
+        peak_z_fixed = meta_z(0, 0);
+        peak_index_random = i;
+        peak_beta_random = meta_beta(0, 0);
+        peak_z_random = meta_z(0, 0);
+      }
+      // Track peak variant (same for fixed and random with 2 tissues)
+      if(meta_z(0, 0) * meta_z(0, 0) > peak_z_fixed * peak_z_fixed && pos[variant_[0][i]]) {
+        peak_index_fixed = i;
+        peak_beta_fixed = meta_beta(0, 0);
+        peak_z_fixed = meta_z(0, 0);
+        peak_index_random = i;
+        peak_beta_random = meta_beta(0, 0);
+        peak_z_random = meta_z(0, 0);
+      }
+      
+      // Compute p-value for filtering
+      double pvalueRandomEffects2Asymptotic_ = 2.0 * (1 - normcdf(meta_z(0, 0)));
+      if(pvalueRandomEffects2Asymptotic_ >= 0.000001) {
+        pos1[variant_[0][i]] = false;
+      }
 
-      Output_stat(i,3*(Cov_.n_rows+1)+0) = meta_z(0,0);
-//      if(statisticRandomEffects2_*statisticRandomEffects2_>peak_z_random*peak_z_random  && pos[variant_[0][i]])
-//      {
-//        peak_index_random=i;
-//        peak_z_random   = statisticRandomEffects2_;
-//      }
-   }
-  if(peak_index_fixed<0)
-   {
-     return -1;
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_random(j,0)=peak_index_fixed;
-     Res_random(j,1)=peak_beta_fixed;;
-     Res_random(j,2)=peak_z_random;
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_fixed(j,0)=peak_index_fixed;
-     Res_fixed(j,1)=peak_beta_fixed;
-     Res_fixed(j,2)=peak_z_random;
-   }
- fstream  FHOU(output.c_str(),ios::out);
-   if(!FHOU)
-    {
-      cout<<"Error for input or output"<<endl;
+      // Store z-score (same for fixed and random with only 2 tissues)
+      Output_stat(i, 3*(Cov_.n_rows+1)+0) = meta_z(0, 0);
+    }  // End of loop over all variants (2 tissues case)
+    
+    // ========================================================================
+    // Save peak variant results and write output file (2 tissues)
+    // ========================================================================
+    if(peak_index_fixed < 0) {
+      return -1;
+    }
+    
+    // Store peak variant results (same for both fixed and random with 2 tissues)
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_random(j, 0) = peak_index_fixed;
+      Res_random(j, 1) = peak_beta_fixed;
+      Res_random(j, 2) = peak_z_random;
+    }
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_fixed(j, 0) = peak_index_fixed;
+      Res_fixed(j, 1) = peak_beta_fixed;
+      Res_fixed(j, 2) = peak_z_random;
+    }
+    
+    // Write results to file
+    fstream FHOU(output.c_str(), ios::out);
+    if(!FHOU) {
+      cout << "Error for input or output" << endl;
       return (1);
     }
-   FHOU<<"Variant"<<"\t"<<"Allele";
-   for(int j=0,indx=0;j<data_index.size();)
-    {
-      if(!data_index[j])
-       {
-         j++;
-         continue;
-
-       }
-
-      FHOU<<"\t"<<"beta_tissue_"<<j<<"\t"<<"sd_tissue_"<<j<<"\t"<<"z_tissue_"<<j;
+    
+    // Write header
+    FHOU << "Variant" << "\t" << "Allele";
+    for(int j = 0, indx = 0; j < data_index.size();) {
+      if(!data_index[j]) {
+        j++;
+        continue;
+      }
+      FHOU << "\t" << "beta_tissue_" << j << "\t" << "sd_tissue_" << j << "\t" << "z_tissue_" << j;
       j++;
       indx++;
     }
-   FHOU<<"\t"<<"fixed_beta"<<"\t"<<"fixed_sd"<<"\t"<<"fixed_z";
-   FHOU<<"\t"<<"Random_Z"<<endl;
-   for(int j1=0;j1<Output_stat.n_rows;j1++)
-    {
-      if(!pos[variant_[0][j1]])
-       {
-         continue;
-       }
-      FHOU<<variant_[0][j1]<<"\t"<<ALLELE[variant_[0][j1]];
-      for(int j2=0;j2<Output_stat.n_cols;j2++)
-       {
-         FHOU<<"\t"<<Output_stat(j1,j2);
-       }
-      FHOU<<endl;
+    FHOU << "\t" << "fixed_beta" << "\t" << "fixed_sd" << "\t" << "fixed_z";
+    FHOU << "\t" << "Random_Z" << endl;
+    
+    // Write data for all variants
+    for(int j1 = 0; j1 < Output_stat.n_rows; j1++) {
+      if(!pos[variant_[0][j1]]) {
+        continue;
+      }
+      FHOU << variant_[0][j1] << "\t" << ALLELE[variant_[0][j1]];
+      for(int j2 = 0; j2 < Output_stat.n_cols; j2++) {
+        FHOU << "\t" << Output_stat(j1, j2);
+      }
+      FHOU << endl;
     }
-   FHOU.clear();
-   FHOU.close(); 
-  } else if(Cov_.n_rows==1)
-  {
-   cout<<"There is only one single data"<<endl;
-   for(int i=0;i<cov_z_score.n_rows;i++)
-    {
+    FHOU.clear();
+    FHOU.close();
+    
+  } else if(Cov_.n_rows == 1) {
+    // ========================================================================
+    // Case 3: Only 1 tissue - no meta-analysis possible
+    // ========================================================================
+    cout << "There is only one single data" << endl;
+    
+    for(int i = 0; i < cov_z_score.n_rows; i++) {
       mat Cov = Cov_;
-      int peak_index=-9999;
+      int peak_index = -9999;
       vector<int> index;
-      map<int,bool> INDEX;
+      map<int, bool> INDEX;
       double meta_logP;
 
-
-
-      for(int X=0;X<Cov.n_rows;X++)
-       {
-         int na_index=0;
-         for(int Y=0;Y<Cov.n_rows;Y++)
-          {
-             if(X==Y)
-              {
+      // Store tissue-specific results (same as fixed/random since only 1 tissue)
+      for(int X = 0; X < Cov.n_rows; X++) {
+        int na_index = 0;
+        for(int Y = 0; Y < Cov.n_rows; Y++) {
+          if(X == Y) {
                 Cov(X,Y)=cov_sd(i,X)*cov_sd(i,Y);
 
               } else
@@ -2531,130 +2650,134 @@ sd.push_back(meta_sd);
 //      COL.push_back(meta_z);
 //      Res.insert(pair<string, vector<double>>(variant_[0][i],COL));
 
-      double meta_beta=cov_beta(i,0);
-      double meta_sd = cov_sd(i,0);
-      double meta_z  =0.0;
-      if(meta_sd>0)
-       {
-         meta_z = meta_beta/meta_sd;
-       }
-      Output_stat(i,3*Cov_.n_rows+0) = meta_beta;
-      Output_stat(i,3*Cov_.n_rows+1) = meta_sd;
-      Output_stat(i,3*Cov_.n_rows+2) = meta_z;
-//      vector<double> COL;
+      // Single tissue - just copy the tissue-specific result
+      double meta_beta = cov_beta(i, 0);
+      double meta_sd = cov_sd(i, 0);
+      double meta_z = 0.0;
+      if(meta_sd > 0) {
+        meta_z = meta_beta / meta_sd;
+      }
       
+      // Store results (same for tissue, fixed, and random with 1 tissue)
+      Output_stat(i, 3*Cov_.n_rows+0) = meta_beta;
+      Output_stat(i, 3*Cov_.n_rows+1) = meta_sd;
+      Output_stat(i, 3*Cov_.n_rows+2) = meta_z;
 
       COL.push_back(meta_z);
-      Res.insert(pair<string, vector<double>>(variant_[0][i],COL));
+      Res.insert(pair<string, vector<double>>(variant_[0][i], COL));
       
       z_score.push_back(meta_z);
       beta.push_back(meta_beta);
       sd.push_back(meta_sd);
-      if(meta_beta<=0)
-            {
-               meta_logP = log10(2.0*normcdf(meta_z));
-            } else
-            {
-              meta_logP = log10(2.0*(1-normcdf(meta_z)));
-            }
-     if(meta_z*meta_z>peak_z_fixed*peak_z_fixed && pos[variant_[0][i]])
-      {
-        peak_index_fixed=i;
-        peak_beta_fixed= meta_beta;
-        peak_z_fixed   = meta_z;
-        peak_index_random=i;
-        peak_beta_random= meta_beta;
-        peak_z_random   = meta_z;
+      
+      // Compute p-value
+      if(meta_beta <= 0) {
+        meta_logP = log10(2.0 * normcdf(meta_z));
+      } else {
+        meta_logP = log10(2.0 * (1 - normcdf(meta_z)));
+      }
+      
+      // Track peak variant
+      if(meta_z * meta_z > peak_z_fixed * peak_z_fixed && pos[variant_[0][i]]) {
+        peak_index_fixed = i;
+        peak_beta_fixed = meta_beta;
+        peak_z_fixed = meta_z;
+        peak_index_random = i;
+        peak_beta_random = meta_beta;
+        peak_z_random = meta_z;
       }
 
-      double pvalueRandomEffects2Asymptotic_ = 2.0*(1-normcdf(meta_z));
-      if(pvalueRandomEffects2Asymptotic_ >=0.000001)
-       {
-         pos1[variant_[0][i]]=false;
-       }
+      double pvalueRandomEffects2Asymptotic_ = 2.0 * (1 - normcdf(meta_z));
+      if(pvalueRandomEffects2Asymptotic_ >= 0.000001) {
+        pos1[variant_[0][i]] = false;
+      }
 
-      Output_stat(i,3*(Cov_.n_rows+1)+0) = meta_z;
-//      if(statisticRandomEffects2_*statisticRandomEffects2_>peak_z_random*peak_z_random  && pos[variant_[0][i]])
-//      {
-//        peak_index_random=peak_index_fixed;
-//        peak_z_random   = meta_z;
-//      }
-   }
-  if(peak_index_fixed<0)
-   {
-     return -1;
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_random(j,0)=peak_index_fixed;
-     Res_random(j,1)=peak_beta_fixed;
-     Res_random(j,2)=peak_z_fixed;
-   }
-  for(int j=0;j<cov_z_score.n_cols;j++)
-   {
-     Res_fixed(j,0)=peak_index_fixed;
-     Res_fixed(j,1)=peak_beta_fixed;
-     Res_fixed(j,2)=peak_z_fixed;
-   }
- fstream  FHOU(output.c_str(),ios::out);
-   if(!FHOU)
-    {
-      cout<<"Error for input or output"<<endl;
+      Output_stat(i, 3*(Cov_.n_rows+1)+0) = meta_z;
+    }  // End of loop over all variants (1 tissue case)
+    
+    // ========================================================================
+    // Save peak variant results and write output file (1 tissue)
+    // ========================================================================
+    if(peak_index_fixed < 0) {
+      return -1;
+    }
+    
+    // Store peak variant results
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_random(j, 0) = peak_index_fixed;
+      Res_random(j, 1) = peak_beta_fixed;
+      Res_random(j, 2) = peak_z_fixed;
+    }
+    for(int j = 0; j < cov_z_score.n_cols; j++) {
+      Res_fixed(j, 0) = peak_index_fixed;
+      Res_fixed(j, 1) = peak_beta_fixed;
+      Res_fixed(j, 2) = peak_z_fixed;
+    }
+    }
+    
+    // Write results to file
+    fstream FHOU(output.c_str(), ios::out);
+    if(!FHOU) {
+      cout << "Error for input or output" << endl;
       return (1);
     }
-   FHOU<<"Variant"<<"\t"<<"Allele";
-   for(int j=0,indx=0;j<data_index.size();)
-    {
-      if(!data_index[j])
-       {
-         j++;
-         continue;
-
-       }
-
-      FHOU<<"\t"<<"beta_tissue_"<<j<<"\t"<<"sd_tissue_"<<j<<"\t"<<"z_tissue_"<<j;
+    
+    // Write header
+    FHOU << "Variant" << "\t" << "Allele";
+    for(int j = 0, indx = 0; j < data_index.size();) {
+      if(!data_index[j]) {
+        j++;
+        continue;
+      }
+      FHOU << "\t" << "beta_tissue_" << j << "\t" << "sd_tissue_" << j << "\t" << "z_tissue_" << j;
       j++;
       indx++;
     }
-   FHOU<<"\t"<<"fixed_beta"<<"\t"<<"fixed_sd"<<"\t"<<"fixed_z";
-   FHOU<<"\t"<<"Random_Z"<<endl;
-   for(int j1=0;j1<Output_stat.n_rows;j1++)
-    {
-      if(!pos[variant_[0][j1]])
-       {
-         continue;
-       }
-      FHOU<<variant_[0][j1]<<"\t"<<ALLELE[variant_[0][j1]];
-      for(int j2=0;j2<Output_stat.n_cols;j2++)
-       {
-         FHOU<<"\t"<<Output_stat(j1,j2);
-       }
-      FHOU<<endl;
+    FHOU << "\t" << "fixed_beta" << "\t" << "fixed_sd" << "\t" << "fixed_z";
+    FHOU << "\t" << "Random_Z" << endl;
+    
+    // Write data for all variants
+    for(int j1 = 0; j1 < Output_stat.n_rows; j1++) {
+      if(!pos[variant_[0][j1]]) {
+        continue;
+      }
+      FHOU << variant_[0][j1] << "\t" << ALLELE[variant_[0][j1]];
+      for(int j2 = 0; j2 < Output_stat.n_cols; j2++) {
+        FHOU << "\t" << Output_stat(j1, j2);
+      }
+      FHOU << endl;
     }
-   FHOU.clear();
-   FHOU.close();
+    FHOU.clear();
+    FHOU.close();
   
+  }  // End of if-else chain for different numbers of tissues
+  
+  // ============================================================================
+  // STEP 6: Return p-value of peak variant
+  // ============================================================================
+  if(Cov_.n_rows >= 3) {
+    // With 3+ tissues, random effects test is available
+    if(meta_mode == "random") {
+      // MODIFIED: For Wald test, use χ²(1) distribution, not mixture
+      // The original code with Han correction would return Han-adjusted p-value
+      // Since we removed Han correction, we use standard χ²(1)
+      if(Han) {
+        // Note: Han correction was removed in modified Wald test
+        // This branch shouldn't be hit with our modifications
+        return 2.0 * (1 - normcdf(abs(sqrt(peak_z_random))));
+      } else {
+        // MODIFIED: Use χ²(1) for Wald test (not 0.5*χ²(1) + 0.5*χ²(2) for LRT)
+        // peak_z_random is the χ² statistic, convert to p-value
+        return gsl_cdf_chisq_Q(peak_z_random, 1.0);
+      }
+    } else {
+      // Fixed effects: peak_z_fixed is a z-score
+      return 2.0 * (1 - normcdf(abs(peak_z_fixed)));
+    }
+  } else if(Cov_.n_rows <= 2) {
+    // With 1-2 tissues, only fixed effects available
+    return 2.0 * (1 - normcdf(abs(peak_z_fixed)));
   }
-if(Cov_.n_rows>=3)
- {
- if(meta_mode =="random")
-  {
-    if(Han)
-     {
-       return 2.0*(1-normcdf(abs(sqrt(peak_z_random))));
-     } else
-     {
-       return 0.5 * gsl_cdf_chisq_Q (peak_z_random, 1.0) + 0.5 * gsl_cdf_chisq_Q (peak_z_random, 2.0);
-     }
-  }else
-  {
-    return 2.0*(1-normcdf(abs(peak_z_fixed)));
-  }
- } else if(Cov_.n_rows<=2)
- {
-//    return 2.0*(1-normcdf(abs(peak_z_fixed)));
-    return 2.0*(1-normcdf(abs(peak_z_fixed)));
- }
 }
 
 

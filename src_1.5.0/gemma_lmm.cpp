@@ -16,6 +16,41 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file gemma_lmm.cpp
+ * @brief Linear Mixed Model implementation for eQTL/multi-tissue analysis
+ * 
+ * This file implements the statistical methods for multi-tissue eQTL analysis
+ * using linear mixed models as described in the mmQTL paper.
+ * 
+ * MATHEMATICAL MODEL:
+ * The core model (Equation 1-3 from mmqtl_extracted.md) is:
+ *   Y_t = X_j*β_{j,t} + ε̂_t
+ * where:
+ *   - Y_t: normalized gene expression for tissue t
+ *   - X_j: normalized genotype dosage for variant j
+ *   - β_{j,t}: variant effect size (estimated in this code)
+ *   - ε̂_t ~ N(0, K*σ²_g + σ²_e*I): residual with genetic relatedness K
+ * 
+ * KEY TRANSFORMATIONS:
+ * The covariance matrix V = K*σ²_g + σ²_e*I = K*λ*σ²_e + σ²_e*I is decomposed as:
+ *   V = U*(D*λ + I)*σ²_e*U^T
+ * where K = U*D*U^T (eigendecomposition), λ = σ²_g/σ²_e (variance ratio)
+ * 
+ * This allows transformation to:
+ *   U^T*Y_t = U^T*X_j*β_{j,t} + U^T*ε̂_t
+ * making the covariance diagonal: (D*λ + I)*σ²_e
+ * 
+ * ESTIMATOR (Equation 4):
+ *   β̂_{j,t} = (X_j^T * V^{-1} * X_j)^{-1} * (X_j^T * V^{-1} * Y_t)
+ * 
+ * ANALYSIS MODES:
+ *   1. Wald test (REMLE)
+ *   2. Likelihood ratio test (MLE)
+ *   3. Score test
+ *   4. All three tests combined
+ */
+
 
 
 #include <iostream>
@@ -54,9 +89,16 @@
 using namespace std;
 
 
-
-
-
+/**
+ * @brief Copy parameters from PARAM structure to LMM object
+ * @param cPar Reference to PARAM object containing analysis configuration
+ * 
+ * Initializes the LMM object with analysis settings including:
+ * - File paths for input/output
+ * - Analysis mode (Wald/LRT/Score tests)
+ * - Sample and SNP filtering indicators
+ * - Search range for variance ratio parameter λ = σ²_g/σ²_e
+ */
 void LMM::CopyFromParam (PARAM &cPar) 
 {
 	a_mode=cPar.a_mode;
@@ -92,7 +134,14 @@ void LMM::CopyFromParam (PARAM &cPar)
 	return;
 }
 
-
+/**
+ * @brief Copy results back to PARAM structure
+ * @param cPar Reference to PARAM object to receive results
+ * 
+ * Updates PARAM with:
+ * - Timing information for matrix operations and optimization
+ * - Number of genes/SNPs tested
+ */
 void LMM::CopyToParam (PARAM &cPar) 
 {
 	cPar.time_UtX=time_UtX;
@@ -104,7 +153,18 @@ void LMM::CopyToParam (PARAM &cPar)
 }
 
 
-
+/**
+ * @brief Write association test results to output file
+ * 
+ * Output format depends on analysis mode:
+ * - Mode 1: beta, SE, lambda_remle, p_wald
+ * - Mode 2: lambda_mle, p_lrt  
+ * - Mode 3: beta, SE, p_score
+ * - Mode 4: All statistics combined
+ * 
+ * For SNP analysis: includes chr, rs, position, alleles, MAF
+ * For gene analysis: includes gene ID only
+ */
 void LMM::WriteFiles () 
 {
 	string file_str;
@@ -184,11 +244,23 @@ void LMM::WriteFiles ()
 
 
 
-
-
-
-
-//map a number 1-(n_cvt+2) to an index between 0 and [(n_c+2)^2+(n_c+2)]/2-1
+/**
+ * @brief Map two indices (a,b) to a single index for symmetric matrix storage
+ * @param a First index (1 to n_cvt+2)
+ * @param b Second index (1 to n_cvt+2)
+ * @param n_cvt Number of covariates
+ * @return Single index for compact storage of upper triangular matrix
+ * 
+ * This function enables efficient storage of symmetric matrices by storing
+ * only the upper triangle. Used for storing products like U^T*W*W^T*U where
+ * W includes covariates and test variants.
+ * 
+ * Index mapping:
+ *   a=1,b=1 → 0
+ *   a=1,b=2 → 1  
+ *   a=2,b=2 → n_cvt+1
+ *   etc.
+ */
 size_t GetabIndex (const size_t a, const size_t b, const size_t n_cvt) {
 	if (a>n_cvt+2 || b>n_cvt+2 || a<=0 || b<=0) {cout<<"error in GetabIndex."<<endl; return 0;}
 	size_t index;
@@ -201,7 +273,30 @@ size_t GetabIndex (const size_t a, const size_t b, const size_t n_cvt) {
 	return index;
 }
 
-
+/**
+ * @brief Calculate P matrices for association tests with covariates
+ * @param n_cvt Number of covariates
+ * @param e_mode Error mode (0 or non-zero for different variance structures)
+ * @param Hi_eval Vector containing (λ*D + I)^{-1} where D are eigenvalues
+ * @param Uab Matrix containing transformed cross-products U^T*[W,X,Y]*[W,X,Y]^T*U
+ * @param ab Vector containing original cross-products [W,X,Y]*[W,X,Y]^T (for e_mode!=0)
+ * @param Pab Output matrix of adjusted P statistics after accounting for covariates
+ * 
+ * MATHEMATICAL BACKGROUND:
+ * This computes projection matrices that account for covariates in the mixed model.
+ * The P matrix represents the variance-adjusted inner products after marginalizing
+ * over covariates using the Woodbury matrix identity iteratively.
+ * 
+ * For the LMM: V^{-1} = H^{-1} = (λ*K + I)^{-1}
+ * In eigenspace: U^T*H*U = λ*D + I (diagonal)
+ * 
+ * The function computes statistics like:
+ *   P_{yy} = Y^T * (H^{-1} - H^{-1}*W*(W^T*H^{-1}*W)^{-1}*W^T*H^{-1}) * Y
+ * which is Y^T*V^{-1}*Y adjusted for covariates W.
+ * 
+ * This is essential for calculating test statistics while controlling for
+ * confounders (covariates).
+ */
 void CalcPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *Hi_eval, const gsl_matrix *Uab, const gsl_vector *ab, gsl_matrix *Pab)
 {
 	size_t index_ab, index_aw, index_bw, index_ww;
@@ -237,7 +332,26 @@ void CalcPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *Hi_eval
 	return;
 }
 
-
+/**
+ * @brief Calculate PPab matrices (second-order derivatives w.r.t. λ)
+ * @param n_cvt Number of covariates
+ * @param e_mode Error mode
+ * @param HiHi_eval Vector containing (λ*D + I)^{-2}
+ * @param Uab Transformed cross-products
+ * @param ab Original cross-products
+ * @param Pab First-order P matrices
+ * @param PPab Output: second derivatives of P matrices w.r.t. λ
+ * 
+ * MATHEMATICAL PURPOSE:
+ * Computes d²/dλ² of the projection matrices. These second derivatives are
+ * needed for:
+ * 1. Newton-Raphson optimization of λ (requires Hessian)
+ * 2. Standard error estimation via Fisher information
+ * 
+ * The variance ratio λ = σ²_g/σ²_e is estimated by maximizing the (restricted)
+ * likelihood. This requires computing derivatives of log-likelihood w.r.t. λ,
+ * which in turn requires derivatives of quadratic forms like Y^T*P*Y.
+ */
 void CalcPPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *HiHi_eval, const gsl_matrix *Uab, const gsl_vector *ab, const gsl_matrix *Pab, gsl_matrix *PPab)
 {
 	size_t index_ab, index_aw, index_bw, index_ww;
@@ -278,7 +392,22 @@ void CalcPPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *HiHi_e
 	return;
 }
 
-
+/**
+ * @brief Calculate PPPab matrices (third-order derivatives w.r.t. λ)
+ * @param n_cvt Number of covariates
+ * @param e_mode Error mode
+ * @param HiHiHi_eval Vector containing (λ*D + I)^{-3}
+ * @param Uab Transformed cross-products
+ * @param ab Original cross-products
+ * @param Pab First-order P matrices
+ * @param PPab Second-order P matrices
+ * @param PPPab Output: third derivatives of P matrices w.r.t. λ
+ * 
+ * MATHEMATICAL PURPOSE:
+ * Third derivatives are used for more accurate optimization and checking
+ * convergence properties. They help ensure the likelihood maximum is not
+ * a saddle point and can improve numerical stability in difficult cases.
+ */
 void CalcPPPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *HiHiHi_eval, const gsl_matrix *Uab, const gsl_vector *ab, const gsl_matrix *Pab, const gsl_matrix *PPab, gsl_matrix *PPPab)
 {
 	size_t index_ab, index_aw, index_bw, index_ww;
@@ -324,7 +453,25 @@ void CalcPPPab (const size_t n_cvt, const size_t e_mode, const gsl_vector *HiHiH
 }
 
 
-
+/**
+ * @brief Log-likelihood function for variance ratio λ
+ * @param l Current value of λ = σ²_g/σ²_e (variance ratio parameter)
+ * @param params Pointer to FUNC_PARAM structure with data and settings
+ * @return Log-likelihood value at λ=l
+ * 
+ * MATHEMATICAL DERIVATION:
+ * For the linear mixed model Y = Xβ + ε where ε ~ N(0, V),
+ * V = λ*σ²_e*K + σ²_e*I = σ²_e*(λ*K + I)
+ * 
+ * The log-likelihood is:
+ *   ℓ(λ) = -n/2*log(2π) - 1/2*log|V| - 1/2*Y^T*V^{-1}*Y
+ * 
+ * After eigendecomposition V = U*(λ*D + I)*σ²_e*U^T and profiling out σ²_e:
+ *   ℓ(λ) ∝ -1/2*log|λ*D + I| - n/2*log(Y^T*(λ*D + I)^{-1}*Y)
+ * 
+ * This function evaluates this profile log-likelihood for optimization.
+ * The MLE of λ maximizes this function (a_mode=2).
+ */
 double LogL_f (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;
@@ -368,10 +515,23 @@ double LogL_f (double l, void *params)
 }
 
  
- 
-
-
-
+/**
+ * @brief First derivative of log-likelihood w.r.t. λ
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @return dℓ/dλ evaluated at λ=l
+ * 
+ * MATHEMATICAL DERIVATION:
+ * The first derivative is:
+ *   dℓ/dλ = -1/2 * tr(H^{-1}*K) + 1/2 * Y^T*H^{-1}*K*H^{-1}*Y / (Y^T*P*Y)
+ * 
+ * where H = λ*K + I, P is the covariate-adjusted projection.
+ * 
+ * This gradient is used for:
+ * 1. Finding roots (MLE/REMLE where dℓ/dλ = 0)
+ * 2. Gradient-based optimization
+ * 3. Checking convergence
+ */
 double LogL_dev1 (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -426,9 +586,21 @@ double LogL_dev1 (double l, void *params)
 	return dev1;
 }
 	
-	
-
-
+/**
+ * @brief Second derivative of log-likelihood w.r.t. λ (Hessian)
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @return d²ℓ/dλ² evaluated at λ=l
+ * 
+ * MATHEMATICAL PURPOSE:
+ * The Hessian (second derivative) is used for:
+ * 1. Newton-Raphson optimization: λ_new = λ_old - (d²ℓ/dλ²)^{-1} * (dℓ/dλ)
+ * 2. Fisher information: I(λ) = -E[d²ℓ/dλ²]
+ * 3. Standard error: SE(λ) = sqrt(-1/(d²ℓ/dλ²))
+ * 4. Checking if critical point is maximum (need d²ℓ/dλ² < 0)
+ * 
+ * A negative Hessian at the MLE confirms we have a maximum, not a minimum.
+ */
 double LogL_dev2 (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -498,9 +670,21 @@ double LogL_dev2 (double l, void *params)
 }
 	
 	
-	
-	
-	
+/**
+ * @brief Compute both first and second derivatives simultaneously
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @param dev1 Output: first derivative dℓ/dλ
+ * @param dev2 Output: second derivative d²ℓ/dλ²
+ * 
+ * EFFICIENCY:
+ * Computing both derivatives together is more efficient than calling
+ * LogL_dev1 and LogL_dev2 separately because intermediate matrices
+ * (Pab, PPab, PPPab) are reused.
+ * 
+ * This is the preferred function for Newton-Raphson optimization which
+ * requires both gradient and Hessian at each iteration.
+ */	
 void LogL_dev12 (double l, void *params, double *dev1, double *dev2)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;
@@ -573,7 +757,28 @@ void LogL_dev12 (double l, void *params, double *dev1, double *dev2)
 }
 
 
-
+/**
+ * @brief Restricted log-likelihood (REML) function
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @return Restricted log-likelihood value at λ=l
+ * 
+ * MATHEMATICAL BACKGROUND:
+ * REML differs from ML by integrating out fixed effects (β), treating them
+ * as nuisance parameters. This reduces bias in variance component estimation.
+ * 
+ * The restricted likelihood is proportional to:
+ *   ℓ_R(λ) = ℓ(λ) - 1/2*log|X^T*V^{-1}*X|
+ * 
+ * where the second term accounts for uncertainty in β.
+ * 
+ * REML is preferred for variance estimation (a_mode=1) because:
+ * 1. Unbiased for variance components in balanced designs
+ * 2. Accounts for degrees of freedom lost estimating fixed effects
+ * 3. More conservative in small samples
+ * 
+ * The REMLE (Restricted Maximum Likelihood Estimator) maximizes this function.
+ */
 double LogRL_f (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -632,7 +837,15 @@ double LogRL_f (double l, void *params)
 }
 
 
-
+/**
+ * @brief First derivative of restricted log-likelihood
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @return dℓ_R/dλ evaluated at λ=l
+ * 
+ * Used to find REMLE where dℓ_R/dλ = 0. The REMLE is preferred over MLE
+ * for Wald tests (a_mode=1) as it provides better variance estimates.
+ */
 double LogRL_dev1 (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -703,7 +916,15 @@ double LogRL_dev1 (double l, void *params)
 
 
 
-
+/**
+ * @brief Second derivative of restricted log-likelihood (REML Hessian)
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure
+ * @return d²ℓ_R/dλ² evaluated at λ=l
+ * 
+ * Used for Newton-Raphson optimization of REMLE and computing standard
+ * errors of variance component estimates.
+ */
 double LogRL_dev2 (double l, void *params)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -787,7 +1008,16 @@ double LogRL_dev2 (double l, void *params)
 	
 
 
-
+/**
+ * @brief Compute both REML derivatives simultaneously
+ * @param l Current value of λ
+ * @param params Pointer to FUNC_PARAM structure  
+ * @param dev1 Output: first derivative dℓ_R/dλ
+ * @param dev2 Output: second derivative d²ℓ_R/dλ²
+ * 
+ * Efficient computation of both derivatives for Newton-Raphson optimization
+ * of the restricted likelihood (used in REMLE estimation).
+ */
 void LogRL_dev12 (double l, void *params, double *dev1, double *dev2)
 {
 	FUNC_PARAM *p=(FUNC_PARAM *) params;	
@@ -878,6 +1108,32 @@ void LogRL_dev12 (double l, void *params, double *dev1, double *dev2)
 
 
 
+/**
+ * @brief Calculate Wald test statistics using REMLE
+ * @param l Variance ratio λ (typically REMLE estimate)
+ * @param params FUNC_PARAM structure with transformed data
+ * @param beta Output: effect size estimate β̂_{j,t} (Equation 4 from model)
+ * @param se Output: standard error of β̂
+ * @param p_wald Output: Wald test p-value
+ * 
+ * MATHEMATICAL IMPLEMENTATION:
+ * Implements the estimator from Equation 4:
+ *   β̂ = (X^T * V^{-1} * X)^{-1} * (X^T * V^{-1} * Y)
+ * 
+ * In transformed space (after eigendecomposition):
+ *   β̂ = P_xy / P_xx
+ * where P_xy = (U^T*X)^T * (λ*D + I)^{-1} * (U^T*Y)
+ * 
+ * Standard error:
+ *   SE(β̂) = sqrt(σ²_e / (X^T * V^{-1} * X)) = sqrt(1 / (τ * P_xx))
+ * where τ = df / P_yy is the residual variance estimate.
+ * 
+ * Wald statistic:
+ *   W = (P_yy - Px_yy) * τ ~ F(1, df)
+ * which tests H0: β = 0 vs H1: β ≠ 0
+ * 
+ * This is the primary test for detecting eQTLs in a_mode=1.
+ */
 void LMM::CalcRLWald (const double &l, const FUNC_PARAM &params, double &beta, double &se, double &p_wald)
 {
 	size_t n_cvt=params.n_cvt;
@@ -917,7 +1173,33 @@ void LMM::CalcRLWald (const double &l, const FUNC_PARAM &params, double &beta, d
 	return ;
 }
 
-
+/**
+ * @brief Calculate Score test statistics
+ * @param l Variance ratio λ (typically MLE from null model)
+ * @param params FUNC_PARAM structure with transformed data
+ * @param beta Output: effect size estimate
+ * @param se Output: standard error
+ * @param p_score Output: Score test p-value
+ * 
+ * MATHEMATICAL BACKGROUND:
+ * The Score test evaluates the derivative of the likelihood at the null
+ * hypothesis (β=0), without requiring MLE under the alternative.
+ * 
+ * Advantages over Wald/LRT:
+ * 1. Only requires fitting null model (more efficient)
+ * 2. More powerful when alternative is far from null
+ * 3. Invariant to parameterization
+ * 
+ * Score statistic:
+ *   S = (U^T*X)^T * (λ*D + I)^{-1} * (U^T*Y)  [score/gradient]
+ *   I = (U^T*X)^T * (λ*D + I)^{-1} * (U^T*X)  [Fisher information]
+ *   
+ * Test statistic:
+ *   T = S^2 / I = n * P_xy² / (P_yy * P_xx) ~ F(1, df)
+ * 
+ * The Score test (a_mode=3) is efficient for genome-wide scans where
+ * the null model is fit once and reused for all SNPs.
+ */
 void LMM::CalcRLScore (const double &l, const FUNC_PARAM &params, double &beta, double &se, double &p_score)
 {
 	size_t n_cvt=params.n_cvt;
@@ -964,7 +1246,28 @@ void LMM::CalcRLScore (const double &l, const FUNC_PARAM &params, double &beta, 
 
 
 
-
+/**
+ * @brief Calculate transformed cross-products U^T * [W,X,Y] * [W,X,Y]^T * U
+ * @param UtW Matrix U^T*W where W contains covariates (n_test × n_cvt)
+ * @param Uty Vector U^T*y where y is the phenotype (n_test × 1)
+ * @param Uab Output: matrix storing all pairwise products in compact form
+ * 
+ * MATHEMATICAL PURPOSE:
+ * After eigendecomposition of K = U*D*U^T, we work in transformed space.
+ * This function computes all cross-products needed for the LMM:
+ * 
+ * Products stored (using GetabIndex mapping):
+ *   U^T*W_i * (U^T*W_j)^T  for all covariate pairs i,j
+ *   U^T*W_i * (U^T*y)^T    for covariate-phenotype products
+ *   U^T*y * (U^T*y)^T      for phenotype variance
+ * 
+ * These are the building blocks for:
+ *   - P matrices used in likelihood calculations
+ *   - Effect size estimates: β̂ = (X^T*V^{-1}*X)^{-1} * X^T*V^{-1}*Y
+ *   - Test statistics
+ * 
+ * The compact storage exploits symmetry: only upper triangle is stored.
+ */
 void CalcUab (const gsl_matrix *UtW, const gsl_vector *Uty, gsl_matrix *Uab) 
 {
 	size_t index_ab;
@@ -1001,7 +1304,25 @@ void CalcUab (const gsl_matrix *UtW, const gsl_vector *Uty, gsl_matrix *Uab)
 	return;
 }
 
-
+/**
+ * @brief Extend Uab to include SNP genotype cross-products
+ * @param UtW Matrix U^T*W (covariates in transformed space)
+ * @param Uty Vector U^T*y (phenotype in transformed space)
+ * @param Utx Vector U^T*x (SNP genotype in transformed space)
+ * @param Uab Output: extended cross-product matrix including SNP
+ * 
+ * MATHEMATICAL PURPOSE:
+ * This function adds the test SNP (x) to the cross-product calculations.
+ * Computes additional products:
+ *   U^T*x * (U^T*W_i)^T  for SNP-covariate products
+ *   U^T*x * (U^T*x)^T    for SNP variance
+ *   U^T*x * (U^T*y)^T    for SNP-phenotype covariance
+ * 
+ * These are needed to test the alternative hypothesis H1: β ≠ 0
+ * by incorporating the SNP into the model alongside covariates.
+ * 
+ * Called for each SNP in genome-wide scan.
+ */
 void CalcUab (const gsl_matrix *UtW, const gsl_vector *Uty, const gsl_vector *Utx, gsl_matrix *Uab) 
 {	
 	size_t index_ab;
@@ -1096,7 +1417,39 @@ void Calcab (const gsl_matrix *W, const gsl_vector *y, const gsl_vector *x, gsl_
 
 
 
-
+/**
+ * @brief Perform eQTL analysis for gene expression data
+ * @param U Eigenvectors of kinship matrix K (n_test × n_test)
+ * @param eval Eigenvalues of K (n_test × 1)
+ * @param UtW Transformed covariates U^T*W
+ * @param Utx Transformed genotype U^T*x (for gene expression as "genotype")
+ * @param W Original covariate matrix
+ * @param x Original gene expression vector (treated as predictor)
+ * 
+ * ANALYSIS WORKFLOW:
+ * For each gene expression phenotype:
+ * 
+ * 1. TRANSFORM TO EIGENSPACE:
+ *    Compute U^T*y for current gene
+ * 
+ * 2. FIT NULL MODEL (no genotype effect):
+ *    Estimate λ_0 maximizing ℓ(λ) or ℓ_R(λ) under H0: β = 0
+ *    Only done for LRT (a_mode=2) and Score test (a_mode=3)
+ * 
+ * 3. FIT ALTERNATIVE MODEL (with genotype):
+ *    Estimate λ_1 and test statistics under H1: β ≠ 0
+ * 
+ * 4. COMPUTE TEST STATISTICS:
+ *    - Wald test (a_mode=1): uses REMLE, tests β̂/SE(β̂)
+ *    - LRT (a_mode=2): tests 2*(ℓ_1 - ℓ_0) ~ χ²(1)
+ *    - Score test (a_mode=3): efficient, uses null model only
+ *    - All tests (a_mode=4)
+ * 
+ * Results stored in sumStat vector for later output.
+ * 
+ * This function is used when gene expression is the PREDICTOR (not response),
+ * which is less common but useful for reverse eQTL analysis.
+ */
 void LMM::AnalyzeGene (const gsl_matrix *U, const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Utx, const gsl_matrix *W, const gsl_vector *x) 
 {
 	ifstream infile (file_gene.c_str(), ifstream::in);
@@ -1198,7 +1551,57 @@ void LMM::AnalyzeGene (const gsl_matrix *U, const gsl_vector *eval, const gsl_ma
 
 
 
-
+/**
+ * @brief Perform genome-wide association scan using BIMBAM format genotypes
+ * @param U Eigenvectors of kinship matrix K
+ * @param eval Eigenvalues of K
+ * @param UtW Transformed covariates U^T*W
+ * @param Uty Transformed phenotype U^T*y (fixed for all SNPs)
+ * @param W Original covariate matrix
+ * @param y Original phenotype vector
+ * 
+ * GENOME-WIDE eQTL ANALYSIS (Standard Case):
+ * Tests association between each SNP and a gene expression phenotype.
+ * 
+ * WORKFLOW FOR EACH SNP:
+ * 
+ * 1. READ GENOTYPE:
+ *    - BIMBAM format: chr rs pos geno1 geno2 ... genoN
+ *    - Genotypes are dosages (0, 1, 2) or probabilities
+ *    - Missing values (NA) imputed with mean genotype
+ * 
+ * 2. QUALITY CONTROL:
+ *    - Mean-center genotypes
+ *    - Flip alleles if mean > 1 (ensure minor allele coding)
+ *    - Skip SNPs based on indicator_snp filter
+ * 
+ * 3. TRANSFORM GENOTYPE:
+ *    Compute U^T*x for current SNP (time tracked in time_UtX)
+ * 
+ * 4. CALCULATE STATISTICS:
+ *    Using pre-computed null model (l_mle_null, logl_mle_H0):
+ *    
+ *    a) Score test (a_mode=3,4): 
+ *       - Most efficient: reuses null model λ
+ *       - Computed first to get β estimate
+ *    
+ *    b) Wald test (a_mode=1,4):
+ *       - Estimates λ via REML for this SNP
+ *       - Computes β̂ and SE(β̂) (Equation 4 from model)
+ *       - Tests H0: β = 0 using t-statistic
+ *    
+ *    c) LRT (a_mode=2,4):
+ *       - Estimates λ via ML for this SNP
+ *       - Compares likelihoods: 2*(ℓ_1 - ℓ_0) ~ χ²(1)
+ * 
+ * 5. STORE RESULTS:
+ *    Summary statistics saved to sumStat vector
+ * 
+ * MULTI-TISSUE CONTEXT:
+ * This implements the single-tissue analysis from Equation 1-4.
+ * For multi-tissue analysis, run separately for each tissue t,
+ * then combine using covariance structure (Equations 5-6).
+ */
 void LMM::AnalyzeBimbam (const gsl_matrix *U, const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const gsl_matrix *W, const gsl_vector *y) 
 {
 	igzstream infile (file_geno.c_str(), igzstream::in);
@@ -1325,7 +1728,38 @@ void LMM::AnalyzeBimbam (const gsl_matrix *U, const gsl_vector *eval, const gsl_
 
 
 
-
+/**
+ * @brief Perform genome-wide association scan using PLINK binary format
+ * @param U Eigenvectors of kinship matrix K
+ * @param eval Eigenvalues of K
+ * @param UtW Transformed covariates U^T*W
+ * @param Uty Transformed phenotype U^T*y
+ * @param W Original covariate matrix
+ * @param y Original phenotype vector
+ * 
+ * PLINK BED FORMAT:
+ * Binary genotype file with 2 bits per genotype:
+ *   00: homozygous major allele (0 copies of minor allele)
+ *   01: missing genotype
+ *   10: heterozygous (1 copy)
+ *   11: homozygous minor allele (2 copies)
+ * 
+ * File structure:
+ *   - 3 magic bytes header
+ *   - Genotypes in SNP-major order (all individuals for SNP1, then SNP2, ...)
+ *   - Efficiently stores large datasets
+ * 
+ * GENOTYPE PROCESSING:
+ * 1. Read 2-bit encoded genotypes from .bed file
+ * 2. Decode: 00→2, 10→1, 11→0, 01→missing
+ * 3. Impute missing with mean genotype
+ * 4. Flip if mean > 1 (ensure minor allele)
+ * 5. Transform: U^T*x
+ * 6. Run association tests (same as AnalyzeBimbam)
+ * 
+ * This is the most memory-efficient format for large GWAS/eQTL studies.
+ * Functionally equivalent to AnalyzeBimbam but for binary genotype files.
+ */
 void LMM::AnalyzePlink (const gsl_matrix *U, const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const gsl_matrix *W, const gsl_vector *y) 
 {
 	string file_bed=file_bfile+".bed";
@@ -1459,7 +1893,35 @@ void LMM::AnalyzePlink (const gsl_matrix *U, const gsl_vector *eval, const gsl_m
 
 
 
-
+/**
+ * @brief Calculate log-likelihood ratios for multiple SNPs (batch processing)
+ * @param U Eigenvectors of kinship matrix K
+ * @param UtX Matrix of transformed genotypes U^T*X for multiple SNPs
+ * @param Uty Transformed phenotype U^T*y
+ * @param K_eval Eigenvalues of kinship matrix
+ * @param l_min Minimum λ for search
+ * @param l_max Maximum λ for search
+ * @param n_region Number of search intervals
+ * @param pos_loglr Output: vector of (position, log-LR) pairs
+ * 
+ * BATCH LRT ANALYSIS:
+ * Performs likelihood ratio tests for multiple SNPs efficiently.
+ * 
+ * For each SNP column in UtX:
+ * 1. Fit null model (no SNP): estimate λ_0, compute ℓ_0
+ * 2. Fit alternative model (with SNP): estimate λ_1, compute ℓ_1
+ * 3. Calculate LRT statistic: LR = 2*(ℓ_1 - ℓ_0)
+ * 
+ * The log-LR can be converted to p-value: p = P(χ²_1 > LR)
+ * 
+ * This is useful for:
+ * - Ranking SNPs by strength of association
+ * - Fine-mapping: identifying causal variants in a region
+ * - Conditional analysis: finding independent signals
+ * 
+ * More efficient than calling CalcLambda individually for each SNP
+ * when multiple SNPs need to be evaluated.
+ */
 void MatrixCalcLR (const gsl_matrix *U, const gsl_matrix *UtX, const gsl_vector *Uty, const gsl_vector *K_eval, const double l_min, const double l_max, const size_t n_region, vector<pair<size_t, double> > &pos_loglr) 
 {
 	double logl_H0, logl_H1, log_lr, lambda0, lambda1;
@@ -1500,7 +1962,54 @@ void MatrixCalcLR (const gsl_matrix *U, const gsl_matrix *UtX, const gsl_vector 
 
 
 
-
+/**
+ * @brief Estimate variance ratio parameter λ = σ²_g/σ²_e
+ * @param func_name 'L' for MLE (max likelihood), 'R' for REMLE (restricted max likelihood)
+ * @param params FUNC_PARAM with data and covariance structure
+ * @param l_min Minimum search value for λ
+ * @param l_max Maximum search value for λ
+ * @param n_region Number of intervals for initial grid search
+ * @param lambda Output: estimated λ value
+ * @param logf Output: log-likelihood (or log-restricted-likelihood) at λ
+ * 
+ * PARAMETER INTERPRETATION:
+ * λ = σ²_g/σ²_e is the ratio of genetic to environmental variance.
+ * 
+ * From the model (Equations 1-3):
+ *   V = K*σ²_g + σ²_e*I = σ²_e*(λ*K + I)
+ * 
+ * - λ = 0: no genetic effects (pure environmental variance)
+ * - λ → ∞: strong genetic effects dominate
+ * - Typical range: [10^-5, 10^5] for robust search
+ * 
+ * ESTIMATION STRATEGY:
+ * 
+ * 1. GRID SEARCH PHASE:
+ *    Divide [l_min, l_max] into n_region intervals (log-scale)
+ *    Find intervals where derivative changes sign (potential maxima)
+ * 
+ * 2. ROOT FINDING (Brent's method):
+ *    For each sign-change interval:
+ *    - Use gsl_root_fsolver_brent to find where dℓ/dλ = 0
+ *    - Robust bracketing method, no derivatives needed
+ * 
+ * 3. REFINEMENT (Newton-Raphson):
+ *    Polish the root using derivatives:
+ *    - λ_new = λ_old - (dℓ/dλ) / (d²ℓ/dλ²)
+ *    - Faster convergence, needs gradient and Hessian
+ * 
+ * 4. BOUNDARY CHECK:
+ *    Evaluate likelihood at l_min and l_max
+ *    Return boundary value if better than interior maximum
+ * 
+ * MLE vs REMLE:
+ * - MLE: maximizes full likelihood (used in LRT, a_mode=2)
+ * - REMLE: accounts for fixed effects uncertainty (used in Wald, a_mode=1)
+ * - REMLE generally preferred for variance estimation (less biased)
+ * 
+ * This is the core optimization for the LMM, analogous to estimating
+ * heritability h² = σ²_g/(σ²_g + σ²_e) = λ/(λ+1).
+ */
 void CalcLambda (const char func_name, FUNC_PARAM &params, const double l_min, const double l_max, const size_t n_region, double &lambda, double &logf)
 {
 	if (func_name!='R' && func_name!='L' && func_name!='r' && func_name!='l') {cout<<"func_name only takes 'R' or 'L': 'R' for log-restricted likelihood, 'L' for log-likelihood."<<endl; return;}
@@ -1664,9 +2173,95 @@ void CalcLambda (const char func_name, const gsl_vector *eval, const gsl_matrix 
 	
 	return;
 }
+
+
+
+
+/**
+ * @brief Estimate λ for null model (wrapper function)
+ * @param func_name 'L' for MLE, 'R' for REMLE
+ * @param eval Eigenvalues of kinship matrix K
+ * @param UtW Transformed covariates U^T*W
+ * @param Uty Transformed phenotype U^T*y
+ * @param l_min Minimum λ to search
+ * @param l_max Maximum λ to search
+ * @param n_region Number of search intervals
+ * @param lambda Output: estimated λ under null model
+ * @param logl_H0 Output: log-likelihood at null model
+ * 
+ * NULL MODEL ESTIMATION:
+ * Fits the model without any test SNP (only covariates):
+ *   Y = W*α + ε, where ε ~ N(0, λ*K*σ²_e + σ²_e*I)
+ * 
+ * This null model is fit ONCE per phenotype, then reused for all SNPs
+ * in Score test (a_mode=3) and LRT (a_mode=2).
+ * 
+ * For Wald test (a_mode=1), λ is re-estimated for each SNP (slower but
+ * potentially more accurate if SNP substantially affects variance structure).
+ */
+void CalcLambda (const char func_name, const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const double l_min, const double l_max, const size_t n_region, double &lambda, double &logl_H0)
+{
+	size_t n_cvt=UtW->size2, ni_test=UtW->size1;
+	size_t n_index=(n_cvt+2+1)*(n_cvt+2)/2;
 	
+	gsl_matrix *Uab=gsl_matrix_alloc (ni_test, n_index);	
+	gsl_vector *ab=gsl_vector_alloc (n_index);	
 	
-//obtain REMLE estimate for PVE using lambda_remle
+	gsl_matrix_set_zero (Uab);
+	CalcUab (UtW, Uty, Uab);
+	//	if (e_mode!=0) {
+	//		gsl_vector_set_zero (ab);
+	//		Calcab (W, y, ab);
+	//	}
+	
+	FUNC_PARAM param0={true, ni_test, n_cvt, eval, Uab, ab, 0};
+	
+	double se=sqrt(-1.0/LogRL_dev2 (lambda, &param0));
+	
+	pve=trace_G*lambda/(trace_G*lambda+1.0);
+	pve_se=trace_G/((trace_G*lambda+1.0)*(trace_G*lambda+1.0))*se;
+	
+	gsl_matrix_free (Uab);
+	gsl_vector_free (ab);	
+	return;
+}
+
+
+/**
+ * @brief Calculate proportion of variance explained (PVE) / heritability
+ * @param eval Eigenvalues of kinship matrix K
+ * @param UtW Transformed covariates
+ * @param Uty Transformed phenotype
+ * @param lambda Estimated variance ratio λ (typically REMLE)
+ * @param trace_G Trace of kinship matrix K (sum of eigenvalues)
+ * @param pve Output: proportion of variance explained by genetics
+ * @param pve_se Output: standard error of PVE estimate
+ * 
+ * MATHEMATICAL DERIVATION:
+ * Total phenotypic variance: σ²_P = σ²_g + σ²_e
+ * 
+ * PVE (also called narrow-sense heritability h²):
+ *   h² = σ²_g / σ²_P = σ²_g / (σ²_g + σ²_e)
+ *      = λ*σ²_e / (λ*σ²_e + σ²_e)
+ *      = λ / (λ + 1)
+ * 
+ * With kinship scaling (trace_G adjustment):
+ *   PVE = trace(K)*λ / (trace(K)*λ + 1)
+ * 
+ * This accounts for the scale of the kinship matrix K.
+ * 
+ * Standard error via delta method:
+ *   SE(PVE) = |∂PVE/∂λ| * SE(λ)
+ *   where SE(λ) = sqrt(-1 / (d²ℓ/dλ²))  [from Fisher information]
+ * 
+ * INTERPRETATION:
+ * - PVE = 0: genetics explains no variance (all environmental)
+ * - PVE = 1: genetics explains all variance  
+ * - PVE = 0.5: half of variance is genetic, half environmental
+ * 
+ * This is a key quantity in quantitative genetics and is related to
+ * the concept of "SNP heritability" in GWAS studies.
+ */
 void CalcPve (const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const double lambda, const double trace_G, double &pve, double &pve_se)
 {
 	size_t n_cvt=UtW->size2, ni_test=UtW->size1;
@@ -1694,9 +2289,46 @@ void CalcPve (const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *U
 	return;
 }
 
-//obtain REML estimate for Vg and Ve using lambda_remle
-//obtain beta and se(beta) for coefficients
-//ab is not used when e_mode==0
+/**
+ * @brief Estimate variance components and fixed effects
+ * @param eval Eigenvalues of kinship matrix K
+ * @param UtW Transformed covariates U^T*W
+ * @param Uty Transformed phenotype U^T*y
+ * @param lambda Estimated variance ratio λ (REMLE)
+ * @param vg Output: genetic variance σ²_g
+ * @param ve Output: environmental variance σ²_e
+ * @param beta Output: vector of fixed effect estimates (covariate effects)
+ * @param se_beta Output: standard errors for beta coefficients
+ * 
+ * MATHEMATICAL DETAILS:
+ * 
+ * 1. VARIANCE COMPONENTS:
+ *    From REML estimation at λ:
+ *    - Residual variance: σ²_e = Y^T*P*Y / df
+ *    - Genetic variance: σ²_g = λ * σ²_e
+ *    where P is the projection matrix adjusted for covariates and λ
+ * 
+ * 2. FIXED EFFECTS (β for covariates):
+ *    β̂ = (W^T * V^{-1} * W)^{-1} * W^T * V^{-1} * Y
+ *    
+ *    In transformed space:
+ *    - Compute H^{-1}*W where H = λ*D + I
+ *    - Solve: (W^T*H^{-1}*W) * β̂ = W^T*H^{-1}*Y
+ *    - Use LU decomposition for numerical stability
+ * 
+ * 3. STANDARD ERRORS:
+ *    Var(β̂) = σ²_e * (W^T * V^{-1} * W)^{-1}
+ *    SE(β̂_i) = sqrt(Var(β̂)_{ii})
+ * 
+ * USAGE:
+ * This provides complete parameter estimates for the LMM:
+ * - Variance components (vg, ve) for understanding genetic architecture
+ * - Fixed effects (beta) for covariate adjustments
+ * - Standard errors for inference
+ * 
+ * These are typically reported alongside eQTL results to characterize
+ * the overall model fit and partition variance.
+ */
 void CalcLmmVgVeBeta (const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const double lambda, double &vg, double &ve, gsl_vector *beta, gsl_vector *se_beta)
 {
 	size_t n_cvt=UtW->size2, ni_test=UtW->size1;
@@ -1767,3 +2399,81 @@ void CalcLmmVgVeBeta (const gsl_vector *eval, const gsl_matrix *UtW, const gsl_v
 	return;
 }
 
+/*
+ * ============================================================================
+ * END OF FILE: gemma_lmm.cpp
+ * ============================================================================
+ * 
+ * SUMMARY OF IMPLEMENTATION:
+ * 
+ * This file implements the statistical framework for multi-tissue eQTL analysis
+ * using linear mixed models (LMMs) as described in the mmQTL paper.
+ * 
+ * KEY MATHEMATICAL CONCEPTS IMPLEMENTED:
+ * 
+ * 1. LINEAR MIXED MODEL (Equations 1-3):
+ *    Y_t = X_j*β_{j,t} + ε̂_t
+ *    where ε̂_t ~ N(0, K*σ²_g + σ²_e*I)
+ *    
+ *    - Accounts for population structure via kinship K
+ *    - Estimates variant effect sizes β controlling for relatedness
+ *    - Partitions variance into genetic (σ²_g) and environmental (σ²_e)
+ * 
+ * 2. EIGENDECOMPOSITION TRICK:
+ *    K = U*D*U^T transforms problem to diagonal covariance:
+ *    - Original: V = K*σ²_g + σ²_e*I (requires O(n³) matrix inversion)
+ *    - Transformed: Ṽ = (D*λ + I)*σ²_e (diagonal, O(n) inversion)
+ *    where λ = σ²_g/σ²_e
+ * 
+ * 3. EFFECT SIZE ESTIMATION (Equation 4):
+ *    β̂ = (X^T*V^{-1}*X)^{-1} * X^T*V^{-1}*Y
+ *    Computed efficiently in eigenspace as P_xy/P_xx
+ * 
+ * 4. VARIANCE RATIO ESTIMATION:
+ *    λ = σ²_g/σ²_e estimated by maximizing:
+ *    - Log-likelihood (MLE) for LRT (a_mode=2)
+ *    - Log-restricted-likelihood (REMLE) for Wald (a_mode=1)
+ *    Using Newton-Raphson with derivatives up to order 3
+ * 
+ * 5. THREE HYPOTHESIS TESTS:
+ *    a) Wald test: (β̂/SE)² ~ F(1,df) - requires REMLE
+ *    b) LRT: 2*(ℓ₁ - ℓ₀) ~ χ²(1) - compares likelihoods
+ *    c) Score test: S²/I ~ F(1,df) - most efficient, uses null model only
+ * 
+ * MULTI-TISSUE EXTENSIONS (from mmqtl_extracted.md):
+ * 
+ * While this file implements single-tissue analysis, it provides the foundation
+ * for multi-tissue meta-analysis:
+ * 
+ * - Covariance across tissues (Equations 5-6): estimates from this code are
+ *   combined using empirical covariance matrix
+ * - Fixed/Random effects meta-analysis: effect sizes β̂_{j,t} from each tissue
+ *   are combined accounting for correlation structure
+ * - Conditional analysis: iteratively identifies independent eQTL signals
+ * 
+ * COMPUTATIONAL EFFICIENCY:
+ * 
+ * - Eigendecomposition done ONCE per phenotype
+ * - Matrix transformations (U^T*X) tracked separately (time_UtX)
+ * - Optimization iterations tracked (time_opt)
+ * - Score test reuses null model for all SNPs (most efficient)
+ * - Compact storage of symmetric matrices via GetabIndex
+ * 
+ * FILE FORMATS SUPPORTED:
+ * 
+ * - PLINK binary (.bed): most memory-efficient for large GWAS
+ * - BIMBAM: flexible text format with dosages
+ * - Gene expression: custom format for reverse eQTL analysis
+ * 
+ * RELATIONSHIP TO BROADER mmQTL FRAMEWORK:
+ * 
+ * This LMM implementation forms the core statistical engine. Other components:
+ * - gemma_eigenlib.cpp: eigendecomposition of kinship matrix
+ * - PostCal.cpp: posterior probability calculations
+ * - caviar_PostCal.cpp: fine-mapping causal variants
+ * - conditional_function.cpp: iterative conditional analysis
+ * - TopKSNP.cpp: selecting top K independent signals
+ * 
+ * Together these implement the full mmQTL pipeline for identifying and
+ * characterizing multi-tissue genetic effects on gene expression.
+ */
