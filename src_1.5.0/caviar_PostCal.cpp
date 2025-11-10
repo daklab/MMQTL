@@ -34,8 +34,8 @@ double postCal::fracdmvnorm(mat Z, mat mean, mat R, mat diagC, double NCP) {
         mat ZcenterMean = Z - mean;
         //mat res1 = trans(ZcenterMean) * inv(R) * (ZcenterMean);
         //mat res2 = trans(ZcenterMean) * inv(newR) *  (ZcenterMean);
-	mat res1 = trans(ZcenterMean) * solve(R, eye(size(R))) * (ZcenterMean);
-	mat res2 = trans(ZcenterMean) * solve(newR, eye(size(newR))) *  (ZcenterMean);
+	mat res1 = trans(ZcenterMean) * solve(R, eye(R.n_rows, R.n_cols)) * (ZcenterMean);
+	mat res2 = trans(ZcenterMean) * solve(newR, eye(newR.n_rows, newR.n_cols)) *  (ZcenterMean);
         double v1 = res1(0,0)/2-res2(0,0)/2;
 	//CHANGE: MOVE FORM NORMAL CALCULATION TO LOG SPACE
         //return(exp(v1)/sqrt(det(newR))* sqrt(det(R)));
@@ -323,12 +323,12 @@ double postCal::findOptimalSetGreedy(double * stat, double NCP, char * pcausalSe
 		total_post = addlogSpace(total_post, postValues[i]);
 	printf("Total Likelihood= %e SNP=%d \n", total_post, snpCount);
 	
-        std::vector<data> items;
+        std::vector<snp_data> items;
         std::set<int>::iterator it;
 	//output the poster to files
         for(int i = 0; i < snpCount; i++) {
              //printf("%d==>%e ",i, postValues[i]/total_likelihood);
-             items.push_back(data(exp(postValues[i]-total_post), i, 0));
+             items.push_back(snp_data(exp(postValues[i]-total_post), i, 0));
         }
         printf("\n");
         std::sort(items.begin(), items.end(), by_number());

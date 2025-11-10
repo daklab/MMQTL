@@ -7,8 +7,8 @@
 #include <map>
 using namespace std;
 
-	struct data {
-                data(double num, int ind1, int ind2) {
+	struct snp_data {
+                snp_data(double num, int ind1, int ind2) {
                         number = num;
                         index1 = ind1;
                         index2 = ind2;
@@ -19,7 +19,7 @@ using namespace std;
         };
 
         struct by_number {
-            bool operator()(data const &left, data const &right) {
+            bool operator()(snp_data const &left, snp_data const &right) {
                 return abs(left.number) > abs(right.number);
             }
         };

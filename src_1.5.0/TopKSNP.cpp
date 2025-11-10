@@ -7,12 +7,12 @@
 
 
 void TopKSNP::findCausal(int * topKConfigure) {
-	std::vector<data> items;
+	std::vector<snp_data> items;
 	std::set<int> geneSet;
 	std::set<int>::iterator it;
 	
 	for(int i = 0; i < snpCount; i++){
-		items.push_back(data(stat[i], i, i));
+		items.push_back(snp_data(stat[i], i, i));
 	}
 	std::sort(items.begin(), items.end(), by_number());
 	printf("\n");

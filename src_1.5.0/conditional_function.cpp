@@ -2750,7 +2750,7 @@ double ConstructCovRandom(vector<vector<vector<double> > > &z_score_, vector<vec
     FHOU.clear();
     FHOU.close();
   
-  }  // End of if-else chain for different numbers of tissues
+  //}  // End of if-else chain for different numbers of tissues - COMMENTED OUT - this was closing the function prematurely
   
   // ============================================================================
   // STEP 6: Return p-value of peak variant

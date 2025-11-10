@@ -23,11 +23,16 @@
 
 #include <assert.h>
 #include <iostream>
-extern "C"
-{
-   #include <cblas.h>   // For OpenBlas / Atlas
-}
+
+// Include GSL headers first (they define CBLAS enums as regular enums)
 #include "gsl/gsl_matrix.h"
+#include "gsl/gsl_cblas.h"
+
+// Don't include system cblas.h as it conflicts with GSL's cblas definitions
+// extern "C"
+// {
+//    #include <cblas.h>   // For OpenBlas / Atlas
+// }
 
 void fast_cblas_dgemm(const enum CBLAS_ORDER Order,
                       const enum CBLAS_TRANSPOSE TransA,

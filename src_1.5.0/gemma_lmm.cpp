@@ -2196,9 +2196,24 @@ void CalcLambda (const char func_name, const gsl_vector *eval, const gsl_matrix 
  * This null model is fit ONCE per phenotype, then reused for all SNPs
  * in Score test (a_mode=3) and LRT (a_mode=2).
  * 
- * For Wald test (a_mode=1), λ is re-estimated for each SNP (slower but
- * potentially more accurate if SNP substantially affects variance structure).
+/**
+ * @brief Calculate proportion of variance explained (PVE) / heritability
+ * @param eval Eigenvalues of kinship matrix K
+ * @param UtW Transformed covariates
+ * @param Uty Transformed phenotype
+ * @param lambda Estimated variance ratio λ (typically REMLE)
+ * @param trace_G Trace of kinship matrix K (sum of eigenvalues)
+ * @param pve Output: proportion of variance explained by genetics
+ * @param pve_se Output: standard error of PVE estimate
+ * 
+ * MATHEMATICAL DERIVATION:
+ * PVE = σ²_g / (σ²_g + σ²_e) = (λ·tr(K)) / (λ·tr(K) + 1)
+ * where λ = σ²_g/σ²_e is the variance ratio
+ * 
+ * Standard error computed via delta method from λ uncertainty.
  */
+/*
+// DUPLICATE FUNCTION - COMMENTED OUT
 void CalcLambda (const char func_name, const gsl_vector *eval, const gsl_matrix *UtW, const gsl_vector *Uty, const double l_min, const double l_max, const size_t n_region, double &lambda, double &logl_H0)
 {
 	size_t n_cvt=UtW->size2, ni_test=UtW->size1;
@@ -2225,10 +2240,10 @@ void CalcLambda (const char func_name, const gsl_vector *eval, const gsl_matrix 
 	gsl_vector_free (ab);	
 	return;
 }
+*/
 
 
 /**
- * @brief Calculate proportion of variance explained (PVE) / heritability
  * @param eval Eigenvalues of kinship matrix K
  * @param UtW Transformed covariates
  * @param Uty Transformed phenotype

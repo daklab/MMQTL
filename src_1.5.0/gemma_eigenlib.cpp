@@ -16,7 +16,7 @@
     along with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "/hpc/users/zengb02/work/software/DPR/src/Eigen/Dense"
+#include <Eigen/Dense>
 // #include "gsl/gsl_linalg.h"
 #include "gsl/gsl_matrix.h"
 // #include "gsl/gsl_vector.h"

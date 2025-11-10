@@ -384,10 +384,10 @@ double PostCal::findOptimalSetGreedy(double * stat, char * configure, int *rank,
 	for(int i = 0; i < snpCount; i++)
 		total_post += postValues[i];
 	printf("Total Likelihood= %e SNP=%d \n", total_post, snpCount);
-        std::vector<data> items;
+        std::vector<snp_data> items;
         std::set<int>::iterator it;
         for(int i = 0; i < snpCount; i++) {
-             items.push_back(data(postValues[i]/total_post, i, 0));
+             items.push_back(snp_data(postValues[i]/total_post, i, 0));
         }
         printf("\n");
         std::sort(items.begin(), items.end(), by_number());
